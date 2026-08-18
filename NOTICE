@@ -1,0 +1,9 @@
+LoboRA
+Copyright 2026 LoboForge
+
+This product depends on DiffSynth-Studio (Apache License 2.0),
+Copyright Zhongjie Duan, 2023. See https://github.com/modelscope/DiffSynth-Studio
+
+MiniMax-H3 model weights are licensed separately by MiniMax
+(MiniMax Community License). Download them from Hugging Face; they are
+not redistributed in this repository.

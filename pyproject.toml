@@ -1,0 +1,42 @@
+[project]
+name = "lobora"
+version = "0.1.0"
+description = "LoRA trainer for MiniMax-H3 with resume, two-stage caching, and mixed image/video buckets"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "LoboForge" }]
+dependencies = [
+    "torch>=2.5.0",
+    "accelerate>=1.3.0",
+    "peft>=0.14.0",
+    "safetensors>=0.5.0",
+    "huggingface_hub>=0.28.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.66.0",
+    "pillow>=10.0.0",
+    "numpy>=1.26.0",
+    "einops>=0.8.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+gpu = [
+    "bitsandbytes>=0.45.0",
+    "diffsynth @ git+https://github.com/modelscope/DiffSynth-Studio.git",
+]
+
+[project.scripts]
+lobora = "lobora.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lobora*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

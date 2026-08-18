@@ -1,0 +1,46 @@
+job:
+  name: h3-ref2va-nf4
+  output_dir: ./output/h3-ref2va-nf4
+
+model:
+  repo_id: DiffSynth-Studio/MiniMax-H3-NF4
+  variant: ref2va
+  precision: nf4
+  model_rev: main
+  fp8_frozen_dit: false
+  cache_text_embeddings: true
+  cache_latents: true
+
+dataset:
+  folder_path: ./dataset
+  caption_ext: txt
+  max_pixels: 399360
+  max_frames: 73
+  default_frames: 39
+  min_bucket_size: 1
+  allow_image_samples: true
+
+lora:
+  rank: 16
+  alpha: 16
+  dropout: 0.0
+  target_modules: [qkv_proj, out_proj]
+
+train:
+  steps: 1500
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
+  optimizer: adamw8bit
+  save_every: 250
+  flow_shift: 2.22
+  audio_flow_shift: 2.22
+
+sample:
+  trigger_word: h3lora
+  width: 480
+  height: 832
+  frames: 22
+  steps: 8
+  sample_every: 250
+  baseline_control: true

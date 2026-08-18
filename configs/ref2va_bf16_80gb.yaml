@@ -1,0 +1,49 @@
+job:
+  name: h3-ref2va-bf16
+  output_dir: ./output/h3-ref2va-bf16
+
+model:
+  repo_id: MiniMaxAI/MiniMax-H3
+  variant: ref2va
+  precision: bf16
+  model_rev: main
+  fp8_frozen_dit: true
+  cache_text_embeddings: true
+  cache_latents: true
+
+dataset:
+  folder_path: ./dataset
+  caption_ext: txt
+  max_pixels: 399360   # 480x832
+  max_frames: 124
+  default_frames: 73
+  min_bucket_size: 2
+  allow_image_samples: true
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules: [qkv_proj, out_proj]
+
+train:
+  steps: 2000
+  batch_size: 1
+  gradient_accumulation_steps: 2
+  learning_rate: 1.0e-4
+  optimizer: adamw
+  weight_decay: 0.01
+  save_every: 250
+  flow_shift: 2.22
+  audio_flow_shift: 2.22
+
+sample:
+  trigger_word: h3lora
+  width: 480
+  height: 832
+  frames: 22
+  steps: 12
+  sample_every: 250
+  sample_every_early: 50
+  sample_early_until: 500
+  baseline_control: true

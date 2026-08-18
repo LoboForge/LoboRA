@@ -1,0 +1,38 @@
+job:
+  name: h3-concept-min
+  output_dir: ./output/h3-concept-min
+
+model:
+  repo_id: MiniMaxAI/MiniMax-H3
+  variant: ref2va
+  precision: bf16
+  model_rev: main
+
+dataset:
+  folder_path: ./dataset
+  allow_image_samples: true
+  default_frames: 22
+  max_frames: 39
+  max_pixels: 196608   # 384x512-ish after snap
+  min_bucket_size: 1
+
+lora:
+  rank: 16
+  alpha: 16
+  target_modules: [qkv_proj, out_proj]
+
+train:
+  steps: 200
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  save_every: 50
+  numerics_gate_steps: 8
+  skip_numerics_gate: false
+
+sample:
+  trigger_word: h3lora
+  frames: 22
+  sample_every: 50
+  sample_every_early: 25
+  sample_early_until: 100
+  baseline_control: true
