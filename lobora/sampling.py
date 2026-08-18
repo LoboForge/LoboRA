@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Sequence
 
 
 @dataclass(frozen=True)
@@ -12,6 +14,7 @@ class SampleJob:
     prompt: str
     seed: int
     tag: str  # control | lora
+    source_id: str = ""  # dataset sample_id when drawn from data; never logged by default
 
 
 def expand_prompt(prompt: str, trigger_word: str) -> str:
@@ -37,8 +40,43 @@ def should_sample_at_step(
     return step % sample_every == 0
 
 
+def pick_prompts_from_dataset(
+    samples: Sequence[Any],
+    *,
+    n: int,
+    seed: int,
+) -> list[dict[str, str]]:
+    """Randomly select caption rows for eval.
+
+    Callers must not print ``prompt`` to logs if privacy matters — only ``name`` / ``source_id``.
+    """
+    if n <= 0:
+        raise ValueError("n must be > 0")
+    if not samples:
+        raise ValueError("dataset is empty; cannot pick sample prompts")
+    rng = random.Random(seed)
+    videos = [s for s in samples if getattr(s, "kind", "") == "video"]
+    pool = videos if len(videos) >= n else list(samples)
+    if len(pool) <= n:
+        chosen = list(pool)
+        rng.shuffle(chosen)
+    else:
+        chosen = rng.sample(pool, n)
+    out: list[dict[str, str]] = []
+    for i, sample in enumerate(chosen):
+        sid = str(getattr(sample, "sample_id", f"ds_{i:02d}"))
+        stem = Path(sid).stem or f"ds_{i:02d}"
+        caption = str(getattr(sample, "caption", "") or "").strip()
+        if not caption:
+            continue
+        out.append({"name": f"ds_{i:02d}_{stem}"[:80], "prompt": caption, "source_id": sid})
+    if not out:
+        raise ValueError("no non-empty captions available for dataset sample prompts")
+    return out
+
+
 def build_sample_jobs(
-    prompts: list[dict],
+    prompts: list,
     *,
     trigger_word: str,
     seed: int,
@@ -48,16 +86,18 @@ def build_sample_jobs(
     jobs: list[SampleJob] = []
     for i, item in enumerate(prompts):
         if isinstance(item, str):
-            name, prompt = f"p{i:02d}", item
+            name, prompt, source_id = f"p{i:02d}", item, ""
         else:
             name = str(item.get("name") or f"p{i:02d}")
             prompt = str(item.get("prompt") or "")
+            source_id = str(item.get("source_id") or "")
         jobs.append(
             SampleJob(
                 name=name,
                 prompt=expand_prompt(prompt, trigger_word),
                 seed=seed + i if walk_seed else seed,
                 tag=tag,
+                source_id=source_id,
             )
         )
     return jobs

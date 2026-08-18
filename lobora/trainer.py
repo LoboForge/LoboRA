@@ -24,7 +24,13 @@ from lobora.lora import (
     save_optimizer,
     write_checkpoint_sidecars,
 )
-from lobora.sampling import build_sample_jobs, sample_dir, sample_filename, should_sample_at_step
+from lobora.sampling import (
+    build_sample_jobs,
+    pick_prompts_from_dataset,
+    sample_dir,
+    sample_filename,
+    should_sample_at_step,
+)
 from lobora.scheduler import H3FlowMatch, mse_flow_loss
 
 
@@ -136,6 +142,18 @@ class LoboRATrainer:
         self.samples = samples
         self.groups = groups
         self.dataset = H3Dataset(samples)
+        if self.cfg.sample.prompts_from_dataset:
+            self.eval_prompts = pick_prompts_from_dataset(
+                samples,
+                n=self.cfg.sample.prompts_from_dataset_n,
+                seed=self.cfg.sample.seed,
+            )
+            info(
+                f"eval prompts: {len(self.eval_prompts)} random dataset rows "
+                f"(ids only; captions not logged)"
+            )
+        else:
+            self.eval_prompts = list(self.cfg.sample.prompts)
         cache = DiskCache(self.paths["cache"])
         self.cache_plan = precompute_or_report(
             cache,
@@ -183,8 +201,9 @@ class LoboRATrainer:
             )
         if not do:
             return
+        prompts = getattr(self, "eval_prompts", None) or self.cfg.sample.prompts
         jobs = build_sample_jobs(
-            self.cfg.sample.prompts,
+            prompts,
             trigger_word=self.cfg.sample.trigger_word,
             seed=self.cfg.sample.seed,
             walk_seed=self.cfg.sample.walk_seed,
@@ -193,11 +212,23 @@ class LoboRATrainer:
         dest = sample_dir(self.paths["root"])
         for job in jobs:
             marker = dest / (sample_filename(step, job) + ".json")
-            marker.write_text(
-                json.dumps({"prompt": job.prompt, "seed": job.seed, "tag": job.tag, "step": step}, indent=2),
-                encoding="utf-8",
-            )
-        info(f"queued {len(jobs)} {tag} samples at step {step}")
+            payload = {
+                "name": job.name,
+                "source_id": job.source_id,
+                "seed": job.seed,
+                "tag": job.tag,
+                "step": step,
+            }
+            if not self.cfg.sample.redact_prompt_sidecars:
+                payload["prompt"] = job.prompt
+            else:
+                # Private path for the sampler process only (not printed).
+                secret = dest / ".prompts" / f"{job.name}.txt"
+                secret.parent.mkdir(parents=True, exist_ok=True)
+                secret.write_text(job.prompt, encoding="utf-8")
+                payload["prompt_file"] = str(secret)
+            marker.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        info(f"queued {len(jobs)} {tag} samples at step {step} (prompt text redacted from logs)")
 
     def _save(self, model, optimizer, step: int, *, name: str | None = None) -> Path:
         dest = self.paths["root"] / (name or f"lora_step_{step:06d}.safetensors")

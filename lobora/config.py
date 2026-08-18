@@ -87,6 +87,10 @@ class SampleConfig:
             },
         ]
     )
+    # If true, ignore ``prompts`` and draw a fixed random subset from the training set
+    # (same subset for baseline + LoRA A/B). Captions are never printed by the trainer.
+    prompts_from_dataset: bool = False
+    prompts_from_dataset_n: int = 4
     trigger_word: str = "h3lora"
     width: int = 480
     height: int = 832
@@ -98,6 +102,8 @@ class SampleConfig:
     sample_every: int = 250
     sample_every_early: int = 50
     sample_early_until: int = 500
+    # When true, sample job sidecars omit prompt text (only name/source_id/seed).
+    redact_prompt_sidecars: bool = True
 
 
 @dataclass

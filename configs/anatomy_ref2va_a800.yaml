@@ -1,0 +1,70 @@
+# Anatomy LoRA on MiniMax-H3 Ref2VA (bf16 base, frozen).
+# Only PEFT adapter weights are trained/saved — base checkpoint is never overwritten.
+
+job:
+  name: anatomy-ref2va-a800
+  output_dir: /workspace/output/anatomy_ref2va_a800
+
+model:
+  repo_id: /workspace/models/MiniMax-H3
+  variant: ref2va
+  precision: bf16
+  model_rev: main
+  fp8_frozen_dit: true
+  cache_text_embeddings: true
+  cache_latents: true
+
+dataset:
+  folder_path: /workspace/dataset
+  caption_ext: txt
+  max_pixels: 399360   # 480x832
+  max_frames: 124
+  default_frames: 73
+  min_bucket_size: 1
+  allow_image_samples: true
+  fps: 24
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  # Attention only first — safer for anatomy; add FFN later if underfit
+  target_modules: [qkv_proj, out_proj]
+
+train:
+  steps: 2000
+  batch_size: 1
+  gradient_accumulation_steps: 4   # effective batch 4 on 1x80GB
+  learning_rate: 1.0e-4
+  optimizer: adamw8bit
+  weight_decay: 0.01
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+  save_every: 100
+  seed: 42
+  resume_from: ""
+  skip_numerics_gate: false
+  numerics_gate_steps: 50
+  flow_shift: 2.22
+  audio_flow_shift: 2.22
+  num_train_timesteps: 1000
+
+sample:
+  # Draw a fixed random subset of training captions for A/B (same set every sample step).
+  # Captions are not logged; sidecars redact prompt text.
+  prompts_from_dataset: true
+  prompts_from_dataset_n: 4
+  redact_prompt_sidecars: true
+  trigger_word: trigger
+  width: 480
+  height: 832
+  frames: 22
+  steps: 12
+  seed: 42
+  walk_seed: true
+  baseline_control: true
+  # Dense cadence for first-ever LoRA on this trainer — catch wash-out early.
+  sample_every: 100
+  sample_every_early: 100
+  sample_early_until: 0
+  prompts: []
