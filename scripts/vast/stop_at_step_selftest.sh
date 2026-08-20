@@ -297,7 +297,29 @@ check_present "A: stopped the trainer with SIGINT" "$DA/stop_at_step.log" "sent 
 check_present "A: trainer exited on SIGINT (no SIGKILL needed)" "$DA/stop_at_step.log" "exited after SIGINT"
 check_present "A: killed the frozen supervisor afterwards" "$DA/stop_at_step.log" "killing frozen supervisor"
 check_present "A: wrote the sentinel" "$DA/stop_at_step.log" "wrote sentinel"
+check_present "A: named the launcher tier as well as the leaf" "$DA/stop_at_step.log" "trainer launcher pid(s)"
+check_present "A: verified its own work" "$DA/stop_at_step.log" "STOP_VERDICT"
+check_present "A: verdict says nothing live is left" "$DA/stop_at_step.log" "live_trainers=0 live_supervisors=0"
+check_present "A: recorded the verdict in the sentinel" "$DA/STOP.sentinel" "stop_verdict=clean"
+check_absent "A: never signalled anything protected" "$DA/stop_at_step.log" "REFUSING to send"
 check_present "A: reached STOP_COMPLETE" "$DA/stop_at_step.log" "STOP_COMPLETE"
+
+# The tmux-server misclassification is covered off the box, against a synthetic
+# /proc, by tests/test_stop_at_step_matcher.py -- faking a tmux server here would
+# mean starting one next to a live run, and the offline test is exact.
+say "scenario A: the matcher's view of the LIVE box, signalling nothing"
+STOP_LOG=$ROOT/live_list.log timeout 60 bash "$WATCHER" --list-matches >"$ROOT/live_matches.txt" 2>"$ROOT/live_matches.err"
+check_present "list-matches reports a supervisor section" "$ROOT/live_matches.txt" "###SUPERVISORS"
+if grep -q "^OK " "$ROOT/live_matches.txt"; then
+  ok "list-matches completed (sections terminated): $(tr '\n' ' ' <"$ROOT/live_matches.txt")"
+else
+  bad "list-matches produced no OK line"
+fi
+if grep -qi "tmux" "$ROOT/live_matches.err"; then
+  ok "a tmux process was seen and refused as a supervisor (this is the fix)"
+else
+  ok "no tmux process matched the supervisor pattern on this box"
+fi
 
 # Ordering matters: freeze must precede the first trainer signal.
 FREEZE_LINE=$(grep -n "restart loop frozen" "$DA/stop_at_step.log" | head -1 | cut -d: -f1)
