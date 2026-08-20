@@ -3,25 +3,53 @@
 
 WHAT THIS DOES (and, importantly, what it does not)
   The box-side watcher (/workspace/stop_at_step.sh, tmux session stop_at_step) halts
-  training at cumulative step 2000. It cannot do the rest: scripts/pull_latest_lora.py
+  training at the cumulative step cap. It cannot do the rest: scripts/pull_latest_lora.py
   runs locally and SSHes into the box, and the vastai CLI is authenticated locally
   only. So this process, on the local machine, drives the follow-on:
 
-    1. poll the box until training has GENUINELY stopped and step-2000 is complete
+    1. poll the box until training has GENUINELY stopped and step-TARGET is complete
     2. pull EVERY remote checkpoint that is not already local (--all backfill)
     3. verify every pulled file independently of the pull script
-    4. only if all of that passes: `vastai stop instance 48056192`
+    4. only if all of that passes: `vastai stop instance <id>`
     5. confirm the instance actually reached a stopped state, and log what it saw
 
   This process never stops training, never signals anything on the box, and never
   writes to the box. It is a reader. The box-side watcher owns the shutdown.
 
+HOW IT DECIDES TRAINING IS OVER (rewritten after this got it wrong and cost money)
+  Two independent conditions, either of which is enough, both loudly logged:
+
+    A. LIVE COUNT. No live trainer process on the box. The count comes from
+       lobora/procscan.py, shipped over SSH and run there: it reads /proc/<pid>/cmdline
+       directly and excludes its own pid, its ancestors and its descendants.
+       The previous implementation counted with `grep -l PAT /proc/[0-9]*/cmdline |
+       wc -l`, which matches grep's own post-exec argv and therefore never returns
+       0 -- so this condition was unsatisfiable and the whole file was dead code.
+       Zombie (Z) and dead (X) processes do not count as live: they hold no GPU
+       memory and cannot run.
+
+    B. BOUNDED OVERRIDE. A live process that will not die must not be able to hold
+       the run open forever. If a FRESH stop sentinel names the target, the target
+       checkpoint is on the box and structurally complete, the checkpoint dir has
+       been quiet, and the heartbeat has been static past PSW_OVERRIDE_STATIC_SECS
+       (measured on the BOX's clock, so a watcher restart does not reset it), the
+       run is finished no matter what `ps` says.
+
+  "FRESH" is the other half of this. A sentinel left behind by a PREVIOUS run must
+  never end the CURRENT one: training was relaunched from step-2000 towards a new
+  cap, so the old sentinel and the old step-2000 are both still sitting on the box.
+  A sentinel counts only if it records a step at/after the configured target AND
+  the heartbeat file has not been written since the sentinel was.
+
 FAIL-OPEN IS THE WHOLE POINT
+
   Once the instance is stopped, SSH is dead and nothing more can be retrieved.
   Every uncertain outcome therefore leaves the instance RUNNING and logs loudly:
   SSH failure, pull failure, a verification failure, a missing checkpoint, a
-  stalled or dead run, a step-2000 that never appeared. $1.10/hr for a few hours
-  is enormously cheaper than losing the final LoRA.
+  stalled or dead run, a target checkpoint that never appeared, a process count
+  that could not be taken at all. $1.10/hr for a few hours is enormously cheaper
+  than losing the final LoRA. That applies to the override too: it changes when
+  the sequence STARTS, never whether the stop is allowed to happen.
 
   `vastai destroy` is never invoked. It is not in this file. Destroying would take
   the 800 GB volume and the 8-hour split-cache with it.
@@ -54,6 +82,12 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+# The one process counter in this tree lives in the package, not in this file, so
+# that this watcher and lora_pull_watcher.py cannot drift apart -- two copies of
+# the counting rules is how the self-matching-grep bug survived unnoticed.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from lobora import procscan, runcap  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Config (env-overridable; defaults are the real run)
@@ -99,12 +133,25 @@ PULL_SCRIPT = env("PSW_PULL_SCRIPT", str(HERE / "pull_latest_lora.py"))
 # PSW_PULL_ARGV lets the self-test substitute a stub for the real pull script.
 PULL_ARGV = json.loads(env("PSW_PULL_ARGV", json.dumps([sys.executable, PULL_SCRIPT])))
 
-TARGET_STEP = env_int("PSW_TARGET_STEP", 2000)
+# The cap, from scripts/vast/h3_env.sh unless PSW_TARGET_STEP overrides it. Never
+# hardcode it here: training was relaunched from step-2000 towards a higher cap,
+# so a stale target matches a checkpoint the live run passed hours ago.
+TARGET_STEP = runcap.target_step("PSW_TARGET_STEP")
 POLL_SECS = env_int("PSW_POLL_SECS", 90)
 MAX_POLLS = env_int("PSW_MAX_POLLS", 0)            # 0 = forever
 STALL_SECS = env_int("PSW_STALL_SECS", 3600)       # heartbeat frozen this long = ALERT
 QUIESCE_SECS = env_int("PSW_QUIESCE_SECS", 120)    # ckpt dir untouched before we trust it
 CONFIRM_POLLS = env_int("PSW_CONFIRM_POLLS", 2)    # consecutive "stopped" reads required
+
+# The bounded override (condition B in the module docstring). 90 minutes: a save
+# lands every 25 micro-batches, so a heartbeat that has not moved in an hour and a
+# half, with the target checkpoint already written and the sentinel already
+# recorded, is a finished run and not a slow one. Set PSW_OVERRIDE=0 to disable.
+OVERRIDE_STATIC_SECS = env_int("PSW_OVERRIDE_STATIC_SECS", 5400)
+OVERRIDE_ENABLED = env("PSW_OVERRIDE", "1") == "1"
+# A heartbeat written this long after the sentinel means the sentinel is from an
+# earlier run and says nothing about this one.
+SENTINEL_STALE_SECS = env_int("PSW_SENTINEL_STALE_SECS", 300)
 SSH_TIMEOUT = env_int("PSW_SSH_TIMEOUT", 60)
 PULL_TIMEOUT = env_int("PSW_PULL_TIMEOUT", 10800)  # 3 h for a full 55-file backfill
 STOP_CONFIRM_SECS = env_int("PSW_STOP_CONFIRM_SECS", 420)
@@ -203,24 +250,34 @@ def take_lock() -> bool:
 # Remote probe -- strictly read-only, one SSH round trip per poll
 # --------------------------------------------------------------------------- #
 
-# The trainer/supervisor patterns are split with an empty-string concatenation so
-# that this payload's own argv (which contains the split form) can never match
-# itself. grep's own /proc entry does not exist when the glob is expanded.
+# The process sections are produced by lobora/procscan.py, shipped to the box and
+# run there. Do NOT be tempted back into `grep PAT /proc/[0-9]*/cmdline | wc -l`:
+# in a pipeline the child expands the glob, so grep is handed its own
+# /proc/<pid>/cmdline, which by then holds grep's argv -- including the pattern.
+# It matches itself and the count never reaches 0. Splitting the pattern with ""
+# does not help; the shell joins it before execve.
+def target_path() -> str:
+    return f"{REMOTE_LORA_DIR}/step-{TARGET_STEP}.safetensors"
+
+
 def _probe_payload() -> str:
-    t_a, t_b = TRAINER_PAT[:8], TRAINER_PAT[8:]
-    s_a, s_b = SUPERVISOR_PAT[:6], SUPERVISOR_PAT[6:]
+    tgt = target_path()
     return "\n".join([
         'echo "###NOW"; date -u +%s',
         f'echo "###SENTINEL"; cat {REMOTE_SENTINEL} 2>/dev/null',
+        f'echo "###SENTMTIME"; stat -c %Y {REMOTE_SENTINEL} 2>/dev/null',
         f'echo "###HB"; tail -n 1 {REMOTE_HEARTBEAT} 2>/dev/null',
         f'echo "###HBMTIME"; stat -c %Y {REMOTE_HEARTBEAT} 2>/dev/null',
         f'echo "###CKPT"; ls -l --time-style=+%s {REMOTE_LORA_DIR} 2>/dev/null',
         f'echo "###RECENT"; find {REMOTE_LORA_DIR} -maxdepth 1 -type f '
         f'-newermt "-{QUIESCE_SECS} seconds" 2>/dev/null | wc -l',
-        f'echo "###TRAINERS"; grep -l "{t_a}""{t_b}" /proc/[0-9]*/cmdline '
-        f'2>/dev/null | wc -l',
-        f'echo "###SUPERVISORS"; grep -l "{s_a}""{s_b}" /proc/[0-9]*/cmdline '
-        f'2>/dev/null | wc -l',
+        # size and declared safetensors header length of the target, so the
+        # override can insist the file is structurally whole before it fires.
+        f'echo "###TARGETHDR"; if [ -f "{tgt}" ]; then printf "%s %s\\n" '
+        f'"$(stat -c %s "{tgt}")" '
+        f'"$(od -An -N8 -tu8 "{tgt}" 2>/dev/null | tr -d " ")"; fi',
+        procscan.remote_scan_command({"TRAINERS": TRAINER_PAT,
+                                      "SUPERVISORS": SUPERVISOR_PAT}),
         f'echo "###STOPLOG"; tail -n 25 {REMOTE_STOP_LOG} 2>/dev/null',
         'echo "###END"',
     ])
@@ -257,6 +314,19 @@ def parse_sections(out: str) -> dict[str, list[str]]:
 # hand-parked attempt1_step-*.safetensors copies cannot match.
 CKPT_RE = re.compile(r"\s(\d+)\s+\d+\s+step-(\d+)\.safetensors$")
 
+SENTINEL_KV_RE = re.compile(r"^([a-z_]+)=(.*)$", re.M)
+
+
+def parse_sentinel(text: str) -> dict:
+    """The key=value block stop_at_step.sh writes. Missing/odd values stay -1."""
+    kv = dict(SENTINEL_KV_RE.findall(text))
+    step = kv.get("stopped_at_cumulative_step", "")
+    return {
+        "step": int(step) if step.isdigit() else -1,
+        "checkpoint": kv.get("checkpoint", ""),
+        "do_not_restart": kv.get("do_not_restart", "") == "1",
+    }
+
 
 def remote_probe() -> dict:
     """One SSH call -> a snapshot of the box. Raises FailOpen on any SSH trouble."""
@@ -288,20 +358,100 @@ def remote_probe() -> dict:
         return default
 
     sentinel = "\n".join(ln for ln in sec.get("SENTINEL", []) if ln.strip())
+    sent = parse_sentinel(sentinel)
+
+    # A section without procscan's trailing OK line is a probe that did not run
+    # (no python on the box, a truncated payload). live == -1, never 0.
+    trainers = procscan.parse_section(sec.get("TRAINERS", []))
+    supervisors = procscan.parse_section(sec.get("SUPERVISORS", []))
+
+    hdr_size = hdr_len = -1
+    for ln in sec.get("TARGETHDR", []):
+        parts = ln.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            hdr_size, hdr_len = int(parts[0]), int(parts[1])
+
     return {
         "box_epoch": one_int("NOW"),
         "sentinel": sentinel,
         "sentinel_present": bool(sentinel),
+        "sentinel_step": sent["step"],
+        "sentinel_ckpt": sent["checkpoint"],
+        "sentinel_mtime": one_int("SENTMTIME"),
         "hb_step": int(hb["step"]) if hb.get("step", "").isdigit() else -1,
         "hb_line": hb_line,
         "hb_mtime": one_int("HBMTIME"),
         "ckpts": ckpts,
         "newest": max(ckpts) if ckpts else -1,
         "recent_writes": one_int("RECENT", 1),
-        "trainers": one_int("TRAINERS", -1),
-        "supervisors": one_int("SUPERVISORS", -1),
+        "trainers": trainers["live"],
+        "trainers_undead": trainers["undead"],
+        "trainer_pids": trainers["pids"],
+        "supervisors": supervisors["live"],
+        "supervisors_undead": supervisors["undead"],
+        "target_size": hdr_size,
+        "target_header_len": hdr_len,
         "stoplog": [ln for ln in sec.get("STOPLOG", []) if ln.strip()],
     }
+
+
+# --------------------------------------------------------------------------- #
+# Is the run over? Two questions, kept separate so the log can say which fired.
+# --------------------------------------------------------------------------- #
+
+def sentinel_is_fresh(probe: dict) -> tuple[bool, str]:
+    """Does the sentinel describe THIS run, or one that already ended?
+
+    Training was relaunched from step-2000 with a new cap, and the old sentinel
+    and old step-2000 are both still on the box. Acting on either would stop a
+    live run. Both tests below have to pass.
+    """
+    if not probe["sentinel_present"]:
+        return False, "no sentinel on the box"
+    if probe["sentinel_step"] < TARGET_STEP:
+        return False, (f"sentinel records step {probe['sentinel_step']}, which is "
+                       f"below the configured target {TARGET_STEP} -- it is from an "
+                       f"earlier run")
+    hb_m, sent_m = probe["hb_mtime"], probe["sentinel_mtime"]
+    if hb_m > 0 and sent_m > 0 and hb_m - sent_m > SENTINEL_STALE_SECS:
+        return False, (f"the heartbeat was written {hb_m - sent_m}s AFTER the "
+                       f"sentinel -- training ran again since that stop")
+    return True, f"sentinel records step {probe['sentinel_step']} and nothing ran since"
+
+
+def target_is_complete(probe: dict) -> tuple[bool, str]:
+    """Structural sanity on the target checkpoint, read from the box.
+
+    This is not the full verification -- that happens locally on the pulled bytes,
+    plus a sha256 cross-check against the box, and it still gates the stop. This
+    is only strong enough to justify STARTING the sequence.
+    """
+    if TARGET_STEP not in probe["ckpts"]:
+        return False, f"step-{TARGET_STEP} is not on the box"
+    size, hlen = probe["target_size"], probe["target_header_len"]
+    if size <= 0:
+        return False, f"step-{TARGET_STEP} could not be stat'd on the box"
+    if hlen < 0:
+        # od missing on the box: not a failure, just less evidence. The local
+        # verification still has to pass before anything is stopped.
+        return True, (f"step-{TARGET_STEP} is {size} bytes (header length "
+                      f"unreadable on the box; local verification still applies)")
+    if not 0 < hlen < size - 8:
+        return False, (f"step-{TARGET_STEP} declares a {hlen}-byte header but is "
+                       f"only {size} bytes -- truncated or still being written")
+    return True, f"step-{TARGET_STEP} is {size} bytes with a plausible {hlen}-byte header"
+
+
+def heartbeat_static_secs(probe: dict, local_secs: float) -> float:
+    """How long the heartbeat has been frozen, preferring the BOX's own clock.
+
+    The local tracker restarts at zero every time this watcher restarts. The box's
+    (now - mtime) does not, which is what makes the override survive a restart.
+    """
+    box_age = -1.0
+    if probe["box_epoch"] > 0 and probe["hb_mtime"] > 0:
+        box_age = float(probe["box_epoch"] - probe["hb_mtime"])
+    return max(local_secs, box_age)
 
 
 def remote_sha256(step: int) -> str:
@@ -590,10 +740,16 @@ def main() -> int:
     log("post_stop_watcher start (LOCAL companion to the box-side stop_at_step.sh)")
     log(f"  instance      : {VAST_INSTANCE} ({VAST_LABEL}) via {VASTAI_BIN}")
     log(f"  box           : {SSH_USER}@{SSH_HOST}:{SSH_PORT}  (read-only polling)")
-    log(f"  target step   : {TARGET_STEP} (cumulative, from step-N.safetensors names)")
+    log(f"  target step   : {TARGET_STEP} (cumulative, from step-N.safetensors names; "
+        f"read from {runcap.source_of('PSW_TARGET_STEP')})")
     log(f"  dest dir      : {DEST_DIR}")
     log(f"  pull          : {' '.join(PULL_ARGV)} --all")
     log(f"  poll/stall    : {POLL_SECS}s / stall alert after {STALL_SECS}s")
+    log(f"  proc count    : lobora/procscan.py shipped to the box (reads "
+        f"/proc/<pid>/cmdline directly; no grep pipeline, no self-match)")
+    log(f"  override      : {'ON' if OVERRIDE_ENABLED else 'OFF'} -- fires only with a "
+        f"FRESH sentinel + a complete step-{TARGET_STEP} + a quiet ckpt dir + a "
+        f"heartbeat static for {OVERRIDE_STATIC_SECS}s")
     log(f"  print_only    : {PRINT_ONLY}  (destroy is NOT implemented in this file)")
     log(f"  fail-open     : ANY pull/verify/SSH/state problem leaves the instance "
         f"RUNNING and logs an ALERT")
@@ -645,22 +801,65 @@ def main() -> int:
 
         newest = probe["newest"]
         trainers = probe["trainers"]
-        target_present = newest >= TARGET_STEP and TARGET_STEP in probe["ckpts"]
-        stalled_for = stall.update(probe["hb_step"], probe["hb_mtime"])
+        target_present = TARGET_STEP in probe["ckpts"]
+        stalled_for = heartbeat_static_secs(
+            probe, stall.update(probe["hb_step"], probe["hb_mtime"]))
+        fresh, fresh_why = sentinel_is_fresh(probe)
+        complete, complete_why = target_is_complete(probe) if target_present \
+            else (False, f"step-{TARGET_STEP} is not on the box")
 
+        undead = probe["trainers_undead"]
+        trainers_txt = "UNKNOWN" if trainers < 0 else str(trainers)
+        if undead:
+            trainers_txt += f" (+{undead} zombie/dead, not counted)"
         log(f"poll {polls}: newest=step-{newest} hb_step={probe['hb_step']} "
-            f"trainers={trainers} supervisors={probe['supervisors']} "
-            f"sentinel={'YES' if probe['sentinel_present'] else 'no'} "
+            f"trainers={trainers_txt} "
+            f"supervisors={probe['supervisors']} "
+            f"sentinel={'FRESH' if fresh else ('stale' if probe['sentinel_present'] else 'no')} "
             f"recent_ckpt_writes={probe['recent_writes']} "
             f"hb_static_for={int(stalled_for)}s")
+        if probe["sentinel_present"] and not fresh:
+            log(f"  sentinel ignored: {fresh_why}")
+        if trainers < 0:
+            alert("count_unknown",
+                  "the box-side process count did not complete (no OK line from "
+                  "procscan -- is python missing on the box?). Treating the trainer "
+                  "count as UNKNOWN, which can never satisfy the stop condition.")
 
+        # A. no live trainer. Zombies and dead entries are not live; a count that
+        #    could not be taken (-1) is not zero either.
         training_stopped = trainers == 0
-        fired = probe["sentinel_present"] or target_present
+        # B. bounded override: something lingers, but the run is demonstrably over.
+        override = (OVERRIDE_ENABLED and not training_stopped and fresh and complete
+                    and probe["recent_writes"] == 0
+                    and stalled_for >= OVERRIDE_STATIC_SECS)
+        fired = fresh or target_present
 
-        if training_stopped and fired:
+        if (OVERRIDE_ENABLED and not training_stopped and fresh and complete
+                and not override):
+            need = OVERRIDE_STATIC_SECS - stalled_for
+            log(f"  the run looks finished ({complete_why}) but {trainers_txt} "
+                f"process(es) linger: the bounded override needs {OVERRIDE_STATIC_SECS}s "
+                f"of static heartbeat and has {int(stalled_for)}s"
+                + (f" -- {int(need)}s to go" if need > 0
+                   else "; waiting for the checkpoint dir to go quiet"))
+
+        if override:
+            alert("override",
+                  f"BOUNDED OVERRIDE: {trainers} trainer process(es) still visible on "
+                  f"the box, but the run is finished and will not be held open by "
+                  f"them. Evidence: {fresh_why}; {complete_why}; the checkpoint dir "
+                  f"has been quiet; the heartbeat has been static for "
+                  f"{int(stalled_for)}s (>= {OVERRIDE_STATIC_SECS}s). Proceeding with "
+                  f"pull and verify. The stop still happens only if EVERY checkpoint "
+                  f"pulls and verifies.", force=True)
+
+        if (training_stopped or override) and fired:
             confirmed += 1
-            log(f"  training appears STOPPED and the stop condition fired "
+            path = "no-live-trainer" if training_stopped else "bounded-override"
+            log(f"  stop condition fired via {path} "
                 f"({confirmed}/{CONFIRM_POLLS} confirmations)")
+            save_state(fire_path=path, fire_path_at=now_iso())
             if confirmed < CONFIRM_POLLS:
                 time.sleep(min(POLL_SECS, 60))
                 continue
@@ -733,12 +932,20 @@ def main() -> int:
             continue
 
         if stalled_for > STALL_SECS:
+            if fresh and complete:
+                why_not = (f"the bounded override needs {OVERRIDE_STATIC_SECS}s of "
+                           f"static heartbeat and has {int(stalled_for)}s"
+                           if OVERRIDE_ENABLED else
+                           "the bounded override is disabled (PSW_OVERRIDE=0)")
+            else:
+                why_not = (f"the override cannot apply: {fresh_why}; {complete_why}")
             alert("stalled",
                   f"the heartbeat has not advanced for {int(stalled_for)}s "
-                  f"(> {STALL_SECS}s) while {trainers} trainer process(es) are still "
-                  f"alive at step {probe['hb_step']}, newest checkpoint step-{newest}. "
-                  f"The run may be wedged. NOT stopping the instance; a human should "
-                  f"look. Last heartbeat line: {probe['hb_line'][:200]}")
+                  f"(> {STALL_SECS}s) while {trainers_txt} trainer process(es) are "
+                  f"still alive at step {probe['hb_step']}, newest checkpoint "
+                  f"step-{newest}. The run may be wedged. NOT stopping the instance; "
+                  f"a human should look -- {why_not}. "
+                  f"Last heartbeat line: {probe['hb_line'][:200]}")
 
         time.sleep(POLL_SECS)
 
