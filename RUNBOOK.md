@@ -296,6 +296,49 @@ state file prevents a double stop or a redundant re-pull. It must run on a machi
 disk guard, the lock, and the shape of the real stop call validated in print-only mode
 so no instance is ever touched by the test. 74/74 assertions pass locally.
 
+### Pulling *during* the run: `scripts/lora_pull_watcher.py`
+
+The post-stop watcher only acts at the end, which leaves fresh checkpoints sitting on
+rented hardware for hours. This one pulls every 30 minutes while training runs:
+
+```bash
+bash scripts/lora_pull_watcher_start.sh   # detached; prints the pid it resolved
+tail -f ~/.lobora/lora_pull_watcher/lora_pull_watcher.log
+kill <pid>                                # pulls stop; nothing on the box is touched
+```
+
+Each cycle is one read-only SSH probe → any `step-N` not already local goes to
+`pull_latest_lora.py --all`, which is idempotent, so a cycle with nothing new costs a
+round trip. Free space is checked against the backfill size first, and a cycle that
+cannot pull (SSH blip, failed pull, full disk) logs it and retries on the next one
+instead of dying.
+
+**It defers to the post-stop watcher rather than competing with it.** The two cannot
+share a lock — the post-stop watcher is typically already running from an older copy of
+the tree — so the coordination is one-sided and verifiable from this side only:
+
+- **Handoff.** The moment training is over — stop sentinel present, `step-2000` on the
+  box, or the trainer processes gone (confirmed twice, so a supervisor restart is not
+  mistaken for the end) — this watcher logs a `FINAL:` line and **exits**. The final
+  backfill, the verification and the instance stop are the post-stop watcher's job, and
+  it does them better. The two therefore never want the same file at the same time.
+- **Mid-pull yield** covers the seconds around that boundary: if the post-stop watcher's
+  log shows a pull that started and has not ended, this one skips the cycle.
+- **Failsafe.** If training is over and the post-stop watcher is *not* alive, nobody
+  would fetch the last checkpoints, so this one does a final `--all` pull itself and
+  says loudly that the instance is still billing. It still never stops anything:
+  `vastai stop` does not appear in the file, only a read-only `vastai show instance`
+  used to recognise a box that is gone for good and exit instead of retrying forever.
+
+Every exit writes one greppable `FINAL:` line, and a lock whose owner pid is dead (or
+has been recycled into an unrelated process) is taken over rather than obeyed — this
+machine has already lost power once mid-run.
+
+`scripts/lora_pull_watcher_selftest.py` drives that exact code against stub `ssh`,
+`vastai` and pull binaries: the no-op cycle, the pull cycle, the disk guard, a pull that
+exits non-zero, transient vs permanent SSH failure, all three handoff paths, the mid-pull
+yield, and both lock cases. 59/59 assertions pass locally.
+
 To check a live run without trawling a multi-GB log, read the heartbeat the patched
 logger writes (step, loss, VRAM peak, headroom, attempt):
 
