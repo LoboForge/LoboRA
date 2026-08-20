@@ -25,6 +25,10 @@ logs/
 post_stop_watcher.state.json
 post_stop_watcher.lock
 post_stop_watcher.stdout
+# lora_pull_watcher runtime state, same deal (LPW_ARTIFACT_DIR).
+lora_pull_watcher.state.json
+lora_pull_watcher.lock
+lora_pull_watcher.stdout
 # Dataset media and captions never belong in the repo. metadata.json/.csv embed the
 # caption text verbatim, so they are as sensitive as the captions themselves.
 dataset/
