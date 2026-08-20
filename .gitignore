@@ -11,11 +11,20 @@ build/
 output/
 models/
 cache/
+split-cache/
+hf_cache/
 *.safetensors
 *.pt
 *.pth
 *.mp4
 *.wav
+*.log
+logs/
+# Dataset media and captions never belong in the repo. metadata.json/.csv embed the
+# caption text verbatim, so they are as sensitive as the captions themselves.
+dataset/
+metadata.json
+metadata.csv
 .DS_Store
 .env
 training.env
