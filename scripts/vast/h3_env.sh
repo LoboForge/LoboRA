@@ -57,3 +57,16 @@ GRAD_ACCUM=${GRAD_ACCUM:-4}
 # Micro-batches, NOT optimizer steps: with GRAD_ACCUM=4 this saves every 25
 # optimizer steps. Keep it small enough that a crash cannot wipe a whole attempt.
 SAVE_STEPS=${SAVE_STEPS:-25}
+
+# THE CAP, and the only place it is written down.
+#
+# The example trainer ignores train.steps and runs a full len(dataset) x
+# dataset_repeat pass, so the cap is enforced externally by stop_at_step.sh. It is
+# CUMULATIVE: it counts step-N.safetensors names, which continue across resumes,
+# not the tqdm bar, which restarts at 0 on every attempt.
+#
+# Four things read this number and they must not disagree: stop_at_step.sh (stops
+# training), post_stop_watcher.py (pulls, verifies, then stops the instance) and
+# lora_pull_watcher.py (pulls during the run) -- the two Python watchers parse this
+# very line via lobora/runcap.py. Change it here and nowhere else.
+STOP_TARGET_STEP=${STOP_TARGET_STEP:-5500}
