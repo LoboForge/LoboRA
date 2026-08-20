@@ -18,8 +18,17 @@ DiffSynth's trainer gives an unattended run nothing to hold on to, so this adds:
 Both are no-ops unless the environment variable is set, so a patched install behaves
 exactly like a stock one for anybody else.
 
-Run it AFTER installing diffsynth, and again after every reinstall or upgrade -- pip
-overwrites site-packages and silently takes the hooks with it.
+Idempotency is keyed on `_write_heartbeat`, which only this script adds. It must NOT be
+keyed on `DIFFSYNTH_STEP_OFFSET`: the step-offset hunk is also carried by
+`patches/diffsynth/site-packages/diffsynth_diffusion.diff`, so on a tree that already has
+that patch the script would report "already patched" and skip the heartbeat in silence --
+and `scripts/pull_latest_lora.py` plus both watchers depend on the heartbeat. The
+step-offset hunk is skipped individually when it is already present.
+
+This patches the file that `import diffsynth` resolves to, i.e. the venv's site-packages,
+which is the copy the trainer imports -- not the git checkout. Run it AFTER installing
+diffsynth, and again after every reinstall or upgrade: pip overwrites site-packages and
+silently takes the hooks with it.
 
     python scripts/vast/patch_diffsynth_logger.py            # patch
     python scripts/vast/patch_diffsynth_logger.py --check    # exit 1 if unpatched
@@ -34,7 +43,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-MARKER = "DIFFSYNTH_STEP_OFFSET"
+# Idempotency marker. It must be unique to THIS script's contribution, so
+# `_write_heartbeat` and not `DIFFSYNTH_STEP_OFFSET`: the step-offset hunk is also carried
+# by patches/diffsynth/site-packages/diffsynth_diffusion.diff. Keyed off the env var name,
+# a tree that already had that patch applied read as "already patched" and the heartbeat
+# was skipped in silence -- and pull_latest_lora.py and both watchers depend on it.
+MARKER = "_write_heartbeat"
+OFFSET_MARKER = 'os.environ.get("DIFFSYNTH_STEP_OFFSET")'
 
 OFFSET_ANCHOR = "        self.num_steps = 0\n"
 OFFSET_PATCH = """        # Cumulative-step base so a warm-started run continues the checkpoint
@@ -98,15 +113,26 @@ def find_logger() -> Path:
 
 
 def patch(text: str) -> str:
-    for anchor, name in ((OFFSET_ANCHOR, "num_steps = 0"),
-                         (STEP_END_ANCHOR, "num_steps += 1"),
+    # The heartbeat hunks are this script's own contribution and are always required.
+    for anchor, name in ((STEP_END_ANCHOR, "num_steps += 1"),
                          (HEARTBEAT_ANCHOR, "def on_epoch_end(")):
         if anchor not in text:
             raise SystemExit(
                 f"error: anchor {name!r} not found -- this DiffSynth version differs from "
                 f"the one these hooks were written against; patch it by hand"
             )
-    text = text.replace(OFFSET_ANCHOR, OFFSET_PATCH, 1)
+    # The step-offset hunk is shared with patches/diffsynth/site-packages/, so it may
+    # already be in place. Skip it then rather than refusing to install the heartbeat.
+    if OFFSET_MARKER in text:
+        print("step offset already present (from patches/diffsynth/); adding heartbeat only")
+    elif OFFSET_ANCHOR in text:
+        text = text.replace(OFFSET_ANCHOR, OFFSET_PATCH, 1)
+    else:
+        raise SystemExit(
+            "error: anchor 'num_steps = 0' not found and DIFFSYNTH_STEP_OFFSET is absent -- "
+            "this DiffSynth version differs from the one these hooks were written against; "
+            "patch it by hand"
+        )
     text = text.replace(STEP_END_ANCHOR, STEP_END_PATCH, 1)
     return text.replace(HEARTBEAT_ANCHOR, HEARTBEAT_PATCH + HEARTBEAT_ANCHOR, 1)
 
