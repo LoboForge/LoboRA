@@ -6,6 +6,7 @@
 #   VENV        python venv holding diffsynth        ($WORKSPACE/venv)
 #   DIFFSYNTH   DiffSynth-Studio checkout            ($WORKSPACE/DiffSynth-Studio)
 #   MODELS_ROOT MiniMax-H3 snapshot                  ($WORKSPACE/models/MiniMax-H3)
+#   MODELS_BASE dir DiffSynth resolves ids against   (parent of MODELS_ROOT)
 #   DATASET     media + sidecar captions             ($WORKSPACE/dataset)
 #   RUN         run name, used for output subdirs     (h3_ref2va)
 #   OUT         run output dir                       ($WORKSPACE/output/$RUN)
@@ -34,7 +35,11 @@ unset PYTHONHOME
 export HF_HOME=${HF_HOME:-$WORKSPACE/hf_cache}
 export TOKENIZERS_PARALLELISM=false
 # Point DiffSynth at the local snapshot and stop it phoning home mid-run.
-export DIFFSYNTH_MODEL_BASE_PATH="$MODELS_ROOT"
+# DiffSynth resolves a model as os.path.join(base_path, model_id) -- for lookup, not
+# just for downloads -- so this must be the PARENT of the snapshot. Setting it to
+# MODELS_ROOT itself resolves to .../models/MiniMax-H3/MiniMax-H3/... and finds nothing.
+MODELS_BASE=${MODELS_BASE:-$(dirname "$MODELS_ROOT")}
+export DIFFSYNTH_MODEL_BASE_PATH="$MODELS_BASE"
 export DIFFSYNTH_SKIP_DOWNLOAD=true
 hash -r
 

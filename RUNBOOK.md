@@ -39,6 +39,22 @@ tmux new-session -d -s h3_train "bash scripts/vast/supervise_stage2.sh"
 bash scripts/vast/restart_stage2.sh             # stop by exact PID + relaunch
 ```
 
+### Which stage-2 script is which
+
+`supervise_stage2.sh` runs [`scripts/vast/train_stage2.sh`](scripts/vast/train_stage2.sh)
+as its inner script (override with `H3_INNER`). That file is the vendored, path-generalized
+copy of what this run actually executed on the box as `/workspace/train_stage2_fp8.sh`:
+the same 23 trainer flags in the same order, with the box's absolute `/workspace` paths
+replaced by variables from [`h3_env.sh`](scripts/vast/h3_env.sh). It is not a separate
+non-fp8 recipe — `--fp8_models` is always passed (§2), which is why the box copy carries
+the `_fp8` suffix and the vendored one does not need it.
+
+[`scripts/train_stage2_resumable.sh`](scripts/train_stage2_resumable.sh) is a **different
+lineage**, not a replacement: identical geometry and cache-affecting flags, but it launches
+LoboRA's own wrapper to persist optimizer and scheduler state (§4). It also drops
+`--use_gradient_checkpointing_offload` and raises `save_steps` to 100, so it has *not* been
+proven to fit in 80 GB — see §3 before reaching for it.
+
 Locally, to get a checkpoint into ComfyUI:
 
 ```bash
