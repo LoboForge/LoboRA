@@ -68,6 +68,14 @@ lobora configs/ref2va_bf16_80gb.yaml \
   --output-dir ./output/run0
 ```
 
+## Running on a rented box
+
+[`RUNBOOK.md`](RUNBOOK.md) is the 2am document: the DiffSynth two-stage recipe, the
+VRAM levers that actually work on an 80 GB card, crash recovery, and the traps that
+silently waste a day — above all the **ComfyUI key remap**, without which a trained
+adapter loads zero patches and renders as the base model. Scripts in
+[`scripts/vast/`](scripts/vast).
+
 Resume after Ctrl+C:
 
 ```bash
