@@ -82,7 +82,7 @@ HEARTBEAT_PATCH = '''    def _write_heartbeat(self, accelerator: Accelerator, lo
             peak = torch.cuda.max_memory_allocated() / 2**30
             current = torch.cuda.memory_allocated() / 2**30
             total = torch.cuda.get_device_properties(0).total_memory / 2**30
-            attempt = os.environ.get("H3_ATTEMPT", "?")
+            attempt = os.environ.get("ANATOMY_ATTEMPT", "?")
             line = (
                 "ts=%s step=%d loss=%.5f vram_current_gib=%.2f vram_peak_gib=%.2f "
                 "vram_total_gib=%.2f headroom_gib=%.2f attempt=%s\\n"

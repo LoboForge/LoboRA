@@ -59,7 +59,10 @@ PY
 
 say "supervisor start (max_attempts=$MAX_ATTEMPTS, inner=$INNER)"
 for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-  export H3_ATTEMPT=$attempt
+  # ANATOMY_ATTEMPT, not H3_ATTEMPT: this is the name the patched logger and
+  # lobora/diffsynth_resume.py read for the beacon's `attempt=` field. The H3_* vars
+  # above are this script's own knobs and are unrelated.
+  export ANATOMY_ATTEMPT=$attempt
   CKPT=$(newest_valid_ckpt)
   STEP_OFFSET=0
   if [ -n "$CKPT" ]; then
