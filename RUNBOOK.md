@@ -6,7 +6,9 @@ Scripts referenced live in [`scripts/vast/`](scripts/vast).
 
 **Read these six first, they are the expensive ones:**
 
-1. §12 — upstream DiffSynth **cannot train H3** unpatched; the four required edits are in [`patches/diffsynth/`](patches/diffsynth).
+1. §12 — upstream DiffSynth **cannot train H3** unpatched, and the four required edits go
+   to **two different trees**; patching only the checkout leaves fp8 silently off.
+   See [`patches/diffsynth/`](patches/diffsynth).
 2. §1 — a LoRA that ComfyUI "loads" with zero patches renders as the base model.
 3. §4 — resume restores **weights only**, and the restarted step counter **overwrites** earlier checkpoints.
 4. §5 — `save_steps` counts **micro-batches**, not optimizer steps.
@@ -19,10 +21,18 @@ Scripts referenced live in [`scripts/vast/`](scripts/vast).
 
 ```bash
 export WORKSPACE=/workspace RUN=my_run          # every script reads these
-bash scripts/vast/bootstrap_diffsynth.sh        # diffsynth from git main + bitsandbytes
+bash scripts/vast/bootstrap_diffsynth.sh        # diffsynth pinned to 0361581 + bitsandbytes
+
+# REQUIRED, see §12. TWO patches, TWO trees -- do not collapse these into one command.
+# The executed example script lives in the checkout:
 git -C $WORKSPACE/DiffSynth-Studio apply \
-  $PWD/patches/diffsynth/diffsynth_box_hand_patches.diff   # REQUIRED, see §12
+  $PWD/patches/diffsynth/checkout/examples_minimax_h3_train.diff
+# The imported package lives in site-packages, resolved at runtime, never hardcoded:
+SITE=$(python -c 'import diffsynth,os;print(os.path.dirname(os.path.dirname(diffsynth.__file__)))')
+patch -p1 -d "$SITE" < $PWD/patches/diffsynth/site-packages/diffsynth_diffusion.diff
+
 python scripts/vast/patch_diffsynth_logger.py   # step-offset + heartbeat hooks
+python scripts/vast/verify_diffsynth_patches.py # fails LOUDLY if fp8 fix is missing
 python scripts/download_weights.py --dest $WORKSPACE/models/MiniMax-H3
 python scripts/vast/rebuild_metadata.py --dataset $WORKSPACE/dataset   # metadata.json
 python scripts/vast/sample_baseline_ref2va.py   # base weights generate? (A/B control)
@@ -306,24 +316,59 @@ tail -5 $WORKSPACE/logs/h3_supervisor.log
 Vast **reassigns the SSH port on every instance restart**. Re-resolve with
 `vastai show instances`, then `LORA_SSH_PORT=<newport> scripts/pull_latest_lora.py`.
 
-## 12. Upstream DiffSynth needs four source edits
+## 12. Upstream DiffSynth needs four source edits — in **two different trees**
 
-Everything above assumes a **patched** DiffSynth-Studio. The four edits the run depended
-on are checked in as [`patches/diffsynth/diffsynth_box_hand_patches.diff`](patches/diffsynth/diffsynth_box_hand_patches.diff),
-with per-file rationale, the exact upstream base commit and reapply commands in
-[`diffsynth_box_hand_patches.md`](patches/diffsynth/diffsynth_box_hand_patches.md)
-alongside it. `git apply --check` was verified against a pristine upstream checkout, so
-the patch is reapplicable rather than archival.
+Everything above assumes a **patched** DiffSynth-Studio. Rationale, the exact upstream base
+commit and the reapply commands are in
+[`patches/diffsynth/README.md`](patches/diffsynth/README.md). `git apply --check` was
+verified against a pristine upstream checkout at the pinned commit, so both patches are
+reapplicable rather than archival.
 
-| File | Failure mode without it |
-|---|---|
-| `examples/minimax_h3/model_training/train.py` | **Training never starts.** Upstream rebuilds `ModelConfig` from `model_id`/`origin_file_pattern` and drops `path=`, so a local processor dir raises `ValueError: No valid model files`. |
-| `diffsynth/diffusion/training_module.py` | fp8 and offload **silently** do not apply to sharded models (`path in fp8_models` can't match, `path` is a list) — no error, just the VRAM blowup of §2/§3. |
-| `diffsynth/diffusion/runner.py` | Stage-1 preprocessing restarts from scratch after an interrupt, and one bad sample aborts the whole 8-hour pass (§9). |
-| `diffsynth/diffusion/logger.py` | Checkpoints restart at `step-100` and overwrite (§4). Superseded on the resumable path, still required by `scripts/vast/supervise_stage2.sh`. |
+**The part that costs money to get wrong.** `bootstrap_diffsynth.sh` produces two
+independent copies of DiffSynth: a **non-editable** `pip install git+...` into the venv's
+`site-packages`, and a separate `git clone` (the training *example* ships in the repo, not
+in the wheel). No files are shared between them. So:
 
-The first three are still needed on every path. Reapply the patch after **any** diffsynth
-reinstall, together with `patch_diffsynth_logger.py`.
+| Patch | Goes to | Why |
+|---|---|---|
+| [`checkout/examples_minimax_h3_train.diff`](patches/diffsynth/checkout/examples_minimax_h3_train.diff) | the **checkout** | `accelerate launch examples/minimax_h3/model_training/train.py` executes that file from the checkout |
+| [`site-packages/diffsynth_diffusion.diff`](patches/diffsynth/site-packages/diffsynth_diffusion.diff) | the **venv `site-packages`** | `from diffsynth.diffusion import *` resolves through `sys.path` to the installed package |
+
+Resolve site-packages at runtime; never hardcode it:
+
+```bash
+SITE=$(python -c 'import diffsynth,os;print(os.path.dirname(os.path.dirname(diffsynth.__file__)))')
+patch -p1 -d "$SITE" < patches/diffsynth/site-packages/diffsynth_diffusion.diff
+```
+
+Verified on the live box, not inferred: the running trainer writes heartbeat lines, and
+`_write_heartbeat` exists **only** in the site-packages copy of `logger.py`, so that
+process was importing site-packages.
+
+Applying everything to the checkout — which earlier revisions of this runbook told you to
+do — gives you a **silently broken box**: `runner.py` unpatched (preprocessing not
+resumable, one bad sample aborts a whole cache pass) and `training_module.py` unpatched
+(**fp8 and offload silently ignored, immediate VRAM blowup with no error**). It stayed
+invisible on the original box only because someone had hand-copied those two files into
+site-packages.
+
+| File | Tree | Failure mode without it |
+|---|---|---|
+| `examples/minimax_h3/model_training/train.py` | checkout | **Training never starts.** Upstream rebuilds `ModelConfig` from `model_id`/`origin_file_pattern` and drops `path=`, so a local processor dir raises `ValueError: No valid model files`. |
+| `diffsynth/diffusion/training_module.py` | site-packages | fp8 and offload **silently** do not apply to sharded models (`path in fp8_models` can't match, `path` is a list) — no error, just the VRAM blowup of §2/§3. |
+| `diffsynth/diffusion/runner.py` | site-packages | Stage-1 preprocessing restarts from scratch after an interrupt, and one bad sample aborts the whole 8-hour pass (§9). |
+| `diffsynth/diffusion/logger.py` | site-packages | Checkpoints restart at `step-100` and overwrite (§4). Superseded on the resumable path, still required by `scripts/vast/supervise_stage2.sh`. |
+
+The first three are still needed on every path. Reapply after **any** diffsynth reinstall
+or upgrade, together with `patch_diffsynth_logger.py`, and then run
+
+```bash
+python scripts/vast/verify_diffsynth_patches.py
+```
+
+which imports the module the trainer will actually import and **exits non-zero** if the
+fp8 fix is absent. That check is the only thing standing between a mis-targeted patch and
+a mystery OOM several GPU-hours later, because the fp8 failure mode emits nothing at all.
 
 ## Privacy
 
