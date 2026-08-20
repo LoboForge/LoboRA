@@ -13,26 +13,33 @@ WHAT THIS IS FOR
   never writes to the box, and -- deliberately, structurally -- has no vastai stop
   or teardown path in this file at all. Billing control belongs to post_stop_watcher.
 
-HOW IT STAYS OUT OF THE POST-STOP WATCHER'S WAY
-  Two watchers pulling into the same directory at the same time is the only real
-  hazard here, and the two cannot share an in-process lock: post_stop_watcher is
-  already running from an older copy of the tree, so any lock protocol added to this
-  file would be respected by exactly one of the two participants. So the coordination
-  is one-sided and verifiable from this side only:
+WHEN IT DECIDES THE RUN IS OVER (rewritten; the first version got this wrong)
+  It used to exit as soon as it saw a stop sentinel OR a step-TARGET checkpoint on
+  the box. Both are FILES, and files outlive the run that made them. Training was
+  relaunched from step-2000 towards a higher cap while step-2000 and the previous
+  run's sentinel were still sitting on the box, so on its next start the old logic
+  would have declared the run finished and exited -- pulling nothing at all for the
+  entire 41-hour run it exists to cover.
 
-    1. HANDOFF. The moment training is over -- stop sentinel present, or step-TARGET
-       on the box, or the trainer processes are gone (confirmed twice, so a supervisor
-       restart is not mistaken for the end) -- this watcher stops pulling and EXITS.
-       Everything after that point is post_stop_watcher's job, and it does it better:
-       it verifies every file and cross-checks sha256 against the box before stopping
-       the instance. The two therefore never want the same file at the same time.
-    2. MID-PULL YIELD. Belt and braces for the seconds around the handoff: before
-       invoking the pull, read post_stop_watcher's own log. If its last pull marker is
-       an unterminated "output begins", it is mid-backfill -- skip this cycle.
-    3. FAILSAFE. If, at handoff, post_stop_watcher is NOT running (crashed, killed,
-       power loss), nobody would do the final pull. In that case this watcher does one
-       last --all pull itself and screams about the instance still billing. It still
-       does not stop anything.
+  Termination is therefore evidence about the PRESENT, not artefacts of the past:
+
+    * no live trainer process, confirmed on consecutive probes, AND
+    * a heartbeat that has not been written for LPW_STATIC_SECS
+
+  Both, together. Either alone is a supervisor restart or a slow step. A sentinel
+  is corroboration when it is FRESH -- it records a step at/after the configured
+  cap and the heartbeat has not been written since -- and is ignored otherwise.
+
+  The cap itself comes from scripts/vast/h3_env.sh via lobora/runcap.py, so this
+  file cannot hold a number the run has already passed.
+
+WHAT IT DOES AT THE END
+  One final `--all` backfill, itself, and then a FINAL: line saying exactly what is
+  local and what is not. It does not hand the job to another process and assume it
+  is done: the post-stop watcher's own fire condition was unsatisfiable for months
+  because of the self-matching grep, so "someone else will pull it" was not true.
+  Before pulling it still yields if the post-stop watcher's log shows an
+  unterminated pull, so the two never fight over the same file.
 
 OTHER THINGS IT REFUSES TO DO
   - fill the disk: free space is checked against the backfill size before every pull
@@ -64,6 +71,12 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Process counting lives in the package, in ONE implementation, shared with
+# post_stop_watcher.py. A second copy of those rules is how the self-matching
+# grep survived unnoticed in both watchers at once.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from lobora import procscan, runcap  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Config (env-overridable; defaults are the real run)
@@ -108,15 +121,22 @@ PULL_SCRIPT = env("LPW_PULL_SCRIPT", str(HERE / "pull_latest_lora.py"))
 # LPW_PULL_ARGV lets the self-test substitute a stub for the real pull script.
 PULL_ARGV = json.loads(env("LPW_PULL_ARGV", json.dumps([sys.executable, PULL_SCRIPT])))
 
-TARGET_STEP = env_int("LPW_TARGET_STEP", 2000)
+# The cap, from scripts/vast/h3_env.sh unless LPW_TARGET_STEP overrides it.
+TARGET_STEP = runcap.target_step("LPW_TARGET_STEP")
 INTERVAL_SECS = env_int("LPW_INTERVAL_SECS", 1800)      # 30 minutes
 RETRY_SECS = env_int("LPW_RETRY_SECS", 300)             # after a failed cycle
 CONFIRM_SECS = env_int("LPW_CONFIRM_SECS", 120)         # re-probe gap for "trainer gone"
 CONFIRM_POLLS = env_int("LPW_CONFIRM_POLLS", 2)
+# A heartbeat older than this, with no trainer process, means the run is over and
+# not merely between attempts. At ~43 s/it and a save every 50 steps, 15 minutes
+# of silence is far outside anything a healthy run produces.
+STATIC_SECS = env_int("LPW_STATIC_SECS", 900)
 SSH_TIMEOUT = env_int("LPW_SSH_TIMEOUT", 60)
 PULL_TIMEOUT = env_int("LPW_PULL_TIMEOUT", 5400)
 MAX_CYCLES = env_int("LPW_MAX_CYCLES", 0)               # 0 = until a terminal state
-MAX_RUNTIME_SECS = env_int("LPW_MAX_RUNTIME_SECS", 16 * 3600)
+# Longer than the run: 2000 -> 5500 at ~43 s/it is about 41 h, and a watcher that
+# retires at hour 16 covers less than half of it.
+MAX_RUNTIME_SECS = env_int("LPW_MAX_RUNTIME_SECS", 60 * 3600)
 SSH_FAILS_BEFORE_VASTAI = env_int("LPW_SSH_FAILS_BEFORE_VASTAI", 2)
 SSH_FAILS_BEFORE_GIVEUP = env_int("LPW_SSH_FAILS_BEFORE_GIVEUP", 10)
 
@@ -206,23 +226,15 @@ def save_state(**kw) -> None:
         log(f"(state write failed: {exc})")
 
 
-def proc_cmdline(pid: int) -> str:
-    try:
-        raw = (PROC_ROOT / str(pid) / "cmdline").read_bytes()
-    except OSError:
-        return ""
-    return raw.replace(b"\0", b" ").decode("utf-8", "replace")
-
-
 def proc_alive(pid: int, hint: str = "") -> bool:
     """Alive, and -- if a hint is given -- still the process we think it is.
 
-    The pid-reuse check matters here: this box has already lost power once, and a
-    recycled pid must not be able to impersonate a watcher forever.
+    Delegated to the shared scanner so the pid-reuse check and the zombie check
+    are the same ones the remote count uses. That matters here: this box has
+    already lost power once, and a recycled pid must not be able to impersonate a
+    watcher forever.
     """
-    if pid <= 0 or not (PROC_ROOT / str(pid)).exists():
-        return False
-    return hint in proc_cmdline(pid) if hint else True
+    return procscan.alive(pid, proc_root=PROC_ROOT, hint=hint)
 
 
 def take_lock() -> bool:
@@ -293,20 +305,21 @@ def psw_mid_pull() -> bool:
 # Remote probe -- strictly read-only, one SSH round trip per cycle
 # --------------------------------------------------------------------------- #
 
-# The process patterns are split with an empty-string concatenation so this
-# payload's own argv on the box can never match itself.
+# The process sections come from lobora/procscan.py, shipped to the box and run
+# there. They used to come from `grep -l PAT /proc/[0-9]*/cmdline | wc -l`, which
+# cannot return 0: the pipeline's child expands the glob, so grep is handed its
+# own /proc entry, which by then holds grep's argv -- pattern included. Splitting
+# the pattern with "" does not help, because the shell joins it before execve.
 def _probe_payload() -> str:
-    t_a, t_b = TRAINER_PAT[:8], TRAINER_PAT[8:]
-    s_a, s_b = SUPERVISOR_PAT[:6], SUPERVISOR_PAT[6:]
     return "\n".join([
         'echo "###NOW"; date -u +%s',
         f'echo "###SENTINEL"; cat {REMOTE_SENTINEL} 2>/dev/null',
+        f'echo "###SENTMTIME"; stat -c %Y {REMOTE_SENTINEL} 2>/dev/null',
         f'echo "###HB"; tail -n 1 {REMOTE_HEARTBEAT} 2>/dev/null',
+        f'echo "###HBMTIME"; stat -c %Y {REMOTE_HEARTBEAT} 2>/dev/null',
         f'echo "###CKPT"; ls -l --time-style=+%s {REMOTE_LORA_DIR} 2>/dev/null',
-        f'echo "###TRAINERS"; grep -l "{t_a}""{t_b}" /proc/[0-9]*/cmdline '
-        f'2>/dev/null | wc -l',
-        f'echo "###SUPERVISORS"; grep -l "{s_a}""{s_b}" /proc/[0-9]*/cmdline '
-        f'2>/dev/null | wc -l',
+        procscan.remote_scan_command({"TRAINERS": TRAINER_PAT,
+                                      "SUPERVISORS": SUPERVISOR_PAT}),
         'echo "###END"',
     ])
 
@@ -375,15 +388,36 @@ def remote_probe() -> dict:
         return default
 
     sentinel = "\n".join(ln for ln in sec.get("SENTINEL", []) if ln.strip())
+    sent_step = ""
+    for ln in sentinel.splitlines():
+        if ln.startswith("stopped_at_cumulative_step="):
+            sent_step = ln.split("=", 1)[1].strip()
+
+    # No trailing OK line means the scan did not run (no python on the box, a
+    # truncated payload). That is UNKNOWN (-1), never 0: a broken probe must not
+    # look like an idle box.
+    trainers = procscan.parse_section(sec.get("TRAINERS", []))
+    supervisors = procscan.parse_section(sec.get("SUPERVISORS", []))
+
+    box_epoch = one_int("NOW")
+    hb_mtime = one_int("HBMTIME")
     return {
         "sentinel": sentinel,
         "sentinel_present": bool(sentinel),
+        "sentinel_step": int(sent_step) if sent_step.isdigit() else -1,
+        "sentinel_mtime": one_int("SENTMTIME"),
+        "box_epoch": box_epoch,
         "hb_step": int(hb["step"]) if hb.get("step", "").isdigit() else -1,
         "hb_loss": hb.get("loss", "?"),
+        "hb_mtime": hb_mtime,
+        # Measured on the BOX's clock, so it survives a restart of this watcher.
+        "hb_static_secs": (box_epoch - hb_mtime
+                           if box_epoch > 0 and hb_mtime > 0 else -1),
         "ckpts": ckpts,
         "newest": max(ckpts) if ckpts else -1,
-        "trainers": one_int("TRAINERS", -1),
-        "supervisors": one_int("SUPERVISORS", -1),
+        "trainers": trainers["live"],
+        "trainers_undead": trainers["undead"],
+        "supervisors": supervisors["live"],
     }
 
 
@@ -422,6 +456,17 @@ def instance_status() -> str:
 
 def dest_name(step: int) -> str:
     return f"{DEST_PREFIX}{step:0{STEP_PAD}d}.safetensors"
+
+
+def save_gap(ckpts: dict) -> int:
+    """The observed save cadence, from the two newest CUMULATIVE step numbers.
+
+    Read rather than assumed: this run saves every 50 micro-batches where the
+    previous one saved every 25, and a hardcoded 25 turns the log line that tells
+    the operator when to expect the next file into a lie.
+    """
+    steps = sorted(ckpts)
+    return (steps[-1] - steps[-2]) if len(steps) >= 2 else 50
 
 
 def local_steps() -> set[int]:
@@ -507,37 +552,42 @@ def pull_missing(missing: list[int]) -> None:
 # Handoff
 # --------------------------------------------------------------------------- #
 
-def handoff(reason: str, missing: list[int]) -> int:
-    """Training is over. post_stop_watcher owns everything from here -- unless it is
-    not running, in which case do one last pull and say so very loudly."""
-    alive, pid = psw_running()
-    log(f"training is over ({reason})")
-    if alive:
-        final(f"handing off to post_stop_watcher (pid {pid}): it will backfill every "
-              f"remaining checkpoint, verify each one against the box, and stop the "
-              f"instance. This watcher is done and is exiting; {len(missing)} "
-              f"checkpoint(s) were still remote at handoff and are its job now. "
-              f"Nothing further is required from this process.")
-        save_state(exit_reason=f"handoff:{reason}", exited_at=now_iso(),
-                   handoff_to_pid=pid, remote_only_at_handoff=missing)
-        return 0
+def finish(reason: str, missing: list[int]) -> int:
+    """Training is over: do the last backfill HERE, then report what is local.
 
-    alert(f"training is over but post_stop_watcher is NOT running "
-          f"(lock pid {pid or 'none'}). Nobody else will do the final pull, and "
-          f"NOBODY WILL STOP THE INSTANCE -- it is still billing. Doing one last "
-          f"backfill here; you must stop the instance yourself: "
-          f"vastai stop instance {VAST_INSTANCE}")
+    This used to hand the final pull to post_stop_watcher and exit. That was a
+    promise this file could not keep -- the post-stop watcher's fire condition was
+    unsatisfiable, so "it will pull the rest" simply was not true. The last pull
+    is cheap and idempotent, so it happens here and the log states the outcome
+    instead of forwarding it.
+    """
+    log(f"training is over ({reason})")
     if missing:
+        log(f"  {len(missing)} checkpoint(s) still only on the box; fetching them now")
         try:
             pull_missing(missing)
         except CycleFailure as exc:
             alert(f"final backfill failed: {exc}")
     else:
-        log("  nothing was missing locally, so there was nothing left to fetch")
-    final(f"exiting after a failsafe final pull. post_stop_watcher was not alive, so "
-          f"instance {VAST_INSTANCE} ({VAST_LABEL}) is very likely STILL RUNNING AND "
-          f"BILLING. Check `vastai show instances` and stop it by hand.")
-    save_state(exit_reason=f"handoff_failsafe:{reason}", exited_at=now_iso())
+        log("  every checkpoint on the box is already local")
+
+    still = sorted(s for s in missing if s not in local_steps())
+    have = sorted(local_steps())
+    running, pid = psw_running()
+    if still:
+        alert(f"{len(still)} checkpoint(s) could NOT be fetched: "
+              f"{', '.join(f'step-{s}' for s in still)}. They exist only on the box. "
+              f"Do not let the instance go away before they are pulled: "
+              f"scripts/pull_latest_lora.py --all")
+    final(f"training is over ({reason}). Local: {len(have)} checkpoint(s), newest "
+          f"step-{have[-1] if have else 'none'}, in {DEST_DIR}. Still remote-only: "
+          f"{len(still)}. This watcher pulls only; it has never had a stop path, so "
+          f"instance {VAST_INSTANCE} ({VAST_LABEL}) is still running and billing "
+          f"until a human decides otherwise"
+          + (f". post_stop_watcher is alive (pid {pid}) but do not assume it will act "
+             f"-- verify its log." if running else ". Nothing else is watching."))
+    save_state(exit_reason=f"finished:{reason}", exited_at=now_iso(),
+               remote_only_at_exit=still)
     return 0
 
 
@@ -545,12 +595,46 @@ def handoff(reason: str, missing: list[int]) -> int:
 # One cycle
 # --------------------------------------------------------------------------- #
 
-def terminal_reason(probe: dict) -> str:
-    if probe["sentinel_present"]:
-        return "stop sentinel is present on the box"
-    if TARGET_STEP in probe["ckpts"]:
-        return f"step-{TARGET_STEP} (the cap) exists on the box"
-    return ""
+def sentinel_is_fresh(probe: dict) -> tuple[bool, str]:
+    """Does the sentinel describe THIS run, or one that already ended?
+
+    The previous run's sentinel and its step-2000 are both still on the box while
+    a new run climbs past them. Acting on either would abandon a live run.
+    """
+    if not probe["sentinel_present"]:
+        return False, "no sentinel"
+    if probe["sentinel_step"] < TARGET_STEP:
+        return False, (f"it records step {probe['sentinel_step']}, below the cap "
+                       f"{TARGET_STEP} -- from an earlier run")
+    hb_m, sent_m = probe["hb_mtime"], probe["sentinel_mtime"]
+    if hb_m > 0 and sent_m > 0 and hb_m - sent_m > STATIC_SECS:
+        return False, (f"the heartbeat was written {hb_m - sent_m}s after it -- "
+                       f"training ran again since that stop")
+    return True, f"it records step {probe['sentinel_step']} and nothing ran since"
+
+
+def terminal_reason(probe: dict, trainer_gone: int) -> str:
+    """Live evidence that the run has ended, or '' to keep pulling.
+
+    Deliberately NOT "a file called step-<cap> exists" and NOT "a sentinel exists".
+    Files outlive the run that wrote them; this run began by resuming from exactly
+    such a file.
+    """
+    if probe["trainers"] != 0 or trainer_gone < CONFIRM_POLLS:
+        return ""
+    static = probe["hb_static_secs"]
+    if static < 0:
+        return (f"no live trainer process (confirmed {trainer_gone}x) and no "
+                f"readable heartbeat on the box")
+    if static < STATIC_SECS:
+        return ""
+    at_cap = probe["newest"] >= TARGET_STEP
+    fresh, why = sentinel_is_fresh(probe)
+    corroboration = (f"; the stop sentinel agrees ({why})" if fresh else "")
+    return (f"no live trainer process (confirmed {trainer_gone}x) and the heartbeat "
+            f"has been static for {static}s; newest checkpoint step-{probe['newest']}"
+            f"{' which is at/past the cap ' + str(TARGET_STEP) if at_cap else ''}"
+            f"{corroboration}")
 
 
 def main() -> int:
@@ -562,12 +646,19 @@ def main() -> int:
     log(f"  dest dir      : {DEST_DIR}")
     log(f"  pull          : {' '.join(PULL_ARGV)} --all")
     log(f"  interval      : {INTERVAL_SECS}s (retry after a failed cycle: {RETRY_SECS}s)")
-    log(f"  target step   : {TARGET_STEP} -- at/after this, post_stop_watcher takes over")
-    log(f"  max runtime   : {MAX_RUNTIME_SECS}s")
+    log(f"  cap           : step-{TARGET_STEP} (cumulative; read from "
+        f"{runcap.source_of('LPW_TARGET_STEP')})")
+    log(f"  ends when     : no live trainer (confirmed {CONFIRM_POLLS}x) AND the "
+        f"heartbeat has been static for {STATIC_SECS}s. NOT when a step-{TARGET_STEP} "
+        f"file or a sentinel merely exists -- both outlive the run that wrote them")
+    log(f"  proc count    : lobora/procscan.py shipped to the box (reads "
+        f"/proc/<pid>/cmdline directly; no grep pipeline, no self-match)")
+    log(f"  max runtime   : {MAX_RUNTIME_SECS}s ({MAX_RUNTIME_SECS / 3600:.0f}h)")
     log(f"  log/state/lock: {LOG_PATH.parent}")
     alive, pid = psw_running()
     log(f"  post_stop_watcher: {'RUNNING pid ' + str(pid) if alive else 'not running'} "
-        f"-- it owns the final pull and the instance stop; this file has no stop path")
+        f"-- this watcher yields to it mid-pull but never delegates its own final "
+        f"backfill to it; this file has no stop path at all")
 
     if not take_lock():
         return 0
@@ -625,36 +716,51 @@ def main() -> int:
             ssh_fails = 0
             have = local_steps()
             missing = sorted(s for s in probe["ckpts"] if s not in have)
+            fresh, fresh_why = sentinel_is_fresh(probe)
+            undead = probe["trainers_undead"]
+            trainers_txt = ("UNKNOWN" if probe["trainers"] < 0
+                            else str(probe["trainers"]))
+            if undead:
+                trainers_txt += f" (+{undead} zombie/dead, not counted)"
             log(f"cycle {cycle}: remote newest=step-{probe['newest']} "
                 f"({len(probe['ckpts'])} on box) local={len(have)} "
                 f"missing={len(missing)} hb_step={probe['hb_step']} "
-                f"loss={probe['hb_loss']} trainers={probe['trainers']} "
-                f"supervisors={probe['supervisors']} "
-                f"sentinel={'YES' if probe['sentinel_present'] else 'no'}")
+                f"loss={probe['hb_loss']} hb_static={probe['hb_static_secs']}s "
+                f"trainers={trainers_txt} supervisors={probe['supervisors']} "
+                f"sentinel={'FRESH' if fresh else ('stale' if probe['sentinel_present'] else 'no')}")
+            if probe["sentinel_present"] and not fresh:
+                log(f"  sentinel ignored: {fresh_why}")
+            if probe["trainers"] < 0:
+                alert("the box-side process count did not complete (no OK line from "
+                      "procscan -- is python missing on the box?). Treating it as "
+                      "UNKNOWN and continuing to pull, which is the safe direction.")
             save_state(last_cycle_at=now_iso(), last_newest=probe["newest"],
                        last_local_count=len(have))
 
-            reason = terminal_reason(probe)
-            if reason:
-                return handoff(reason, missing)
-
             if probe["trainers"] == 0:
                 trainer_gone += 1
-                log(f"  no trainer process on the box "
+                log(f"  no live trainer process on the box "
                     f"({trainer_gone}/{CONFIRM_POLLS} confirmations). A supervisor "
-                    f"restart looks like this for a few seconds, so re-checking in "
-                    f"{CONFIRM_SECS}s before concluding anything.")
-                if trainer_gone >= CONFIRM_POLLS:
-                    return handoff("the trainer processes are gone "
-                                   f"(confirmed {trainer_gone}x)", missing)
+                    f"restart looks exactly like this for a few seconds, so this is "
+                    f"re-checked in {CONFIRM_SECS}s and cross-checked against the "
+                    f"heartbeat before anything is concluded.")
+            else:
+                trainer_gone = 0
+
+            reason = terminal_reason(probe, trainer_gone)
+            if reason:
+                return finish(reason, missing)
+
+            if probe["trainers"] == 0:
+                # Gone but not yet corroborated: come back sooner than a full cycle.
                 time.sleep(CONFIRM_SECS)
                 continue
-            trainer_gone = 0
 
             if not missing:
                 log(f"  nothing to do: every one of the {len(probe['ckpts'])} "
-                    f"checkpoints on the box is already local. Next checkpoint should "
-                    f"be step-{probe['newest'] + 25}.")
+                    f"checkpoints on the box is already local. Next one should be "
+                    f"step-{probe['newest'] + save_gap(probe['ckpts'])}, and the cap "
+                    f"is step-{TARGET_STEP}.")
                 time.sleep(INTERVAL_SECS)
                 continue
 

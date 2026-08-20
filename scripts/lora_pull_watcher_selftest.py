@@ -45,22 +45,48 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 # --------------------------------------------------------------------------- #
 
 SSH_STUB = r'''#!/usr/bin/env python3
-"""Stub ssh: emits the probe sections described by a scenario JSON."""
+"""Stub ssh: emits the probe sections described by a scenario JSON.
+
+Process sections use procscan's wire format -- "<pid> <state>" lines then
+"OK <live> <undead>" -- because that is what the box sends now. `trainers_raw`
+lets a scenario emit something with no OK line, which is a probe that did not run.
+"""
 import json, os, sys
 sc = json.load(open(os.environ["LPW_TEST_SCENARIO"]))
 if sc.get("ssh_exit"):
     sys.stderr.write("stub ssh: connection refused\n")
     sys.exit(int(sc["ssh_exit"]))
-print("###NOW"); print(sc.get("box_epoch", 1787200000))
+epoch = sc.get("box_epoch", 1787200000)
+
+
+def procsec(name, live, undead=0, raw=None):
+    print("###" + name)
+    if raw is not None:
+        for line in raw:
+            print(line)
+        return
+    for i in range(live):
+        print("%d S" % (4000 + i))
+    for i in range(undead):
+        print("%d Z" % (4900 + i))
+    print("OK %d %d" % (live, undead))
+
+
+print("###NOW"); print(epoch)
 print("###SENTINEL")
 if sc.get("sentinel"):
     print("stopped_at_cumulative_step=%s" % sc.get("sentinel_step", 2000))
+print("###SENTMTIME")
+if sc.get("sentinel"):
+    print(sc.get("sentinel_mtime", epoch))
 print("###HB"); print("step=%s loss=%s" % (sc.get("hb_step", 1850), sc.get("loss", "0.02")))
+print("###HBMTIME"); print(sc.get("hb_mtime", epoch))
 print("###CKPT")
 for step in sc["ckpts"]:
     print("-rw-r--r-- 1 root root 131227832 1787200000 step-%d.safetensors" % step)
-print("###TRAINERS"); print(sc.get("trainers", 3))
-print("###SUPERVISORS"); print(sc.get("supervisors", 3))
+procsec("TRAINERS", sc.get("trainers", 3), sc.get("trainers_undead", 0),
+        sc.get("trainers_raw"))
+procsec("SUPERVISORS", sc.get("supervisors", 3))
 print("###END")
 '''
 
@@ -142,6 +168,10 @@ class Sandbox:
             "LPW_RETRY_SECS": "0",
             "LPW_CONFIRM_SECS": "0",
             "LPW_MAX_CYCLES": "1",
+            # The live cap is 5500; these scenarios are written around 2000 and
+            # say so explicitly rather than leaning on the declared default.
+            "LPW_TARGET_STEP": "2000",
+            "LPW_STATIC_SECS": "900",
         })
         env.update({k: str(v) for k, v in env_over.items()})
         return subprocess.run([PY, str(WATCHER)], capture_output=True, text=True,
@@ -254,76 +284,129 @@ def scenario_instance_stopped(sb: Sandbox) -> None:
     check("names where the files are", "dest" in out, out[-800:])
 
 
-def scenario_handoff_sentinel(sb: Sandbox) -> None:
-    print("\n[7] stop sentinel + a live post_stop_watcher -> hand off and exit, no pull")
-    psw = spawn_marker_process("post_stop_watcher")
-    try:
-        sb.psw_lock.write_text(f"{psw.pid}\n")
-        sb.local([1800])
-        r = sb.run({"ckpts": [1800, 1825], "sentinel": True, "trainers": 0},
-                   LPW_MAX_CYCLES="0")
-        out = r.stdout
-        check("exits 0", r.returncode == 0, f"rc={r.returncode}")
-        check("detects the sentinel", "stop sentinel is present" in out, out[-800:])
-        check("hands off to the post-stop watcher pid",
-              f"handing off to post_stop_watcher (pid {psw.pid})" in out, out[-800:])
-        check("does NOT pull (no race over the same files)", sb.pull_calls() == [],
-              str(sb.pull_calls()))
-    finally:
-        psw.kill()
+def scenario_stale_evidence_does_not_end_a_live_run(sb: Sandbox) -> None:
+    print("\n[7] THE REGRESSION: last run's step-2000 + last run's sentinel, live "
+          "trainer -> keep pulling")
+    # Exactly today's box: the run resumed from step-2000 towards a higher cap, so
+    # step-2000 and a sentinel recording it are both still lying around. The first
+    # version of this file exited here and pulled nothing for the whole run.
+    sb.local([2000])
+    r = sb.run({"ckpts": [2000, 2050, 2100], "sentinel": True, "sentinel_step": 2000,
+                "sentinel_mtime": 1787200000, "hb_mtime": 1787209000,
+                "box_epoch": 1787209000, "hb_step": 2106, "trainers": 3},
+               LPW_TARGET_STEP="5500")
+    out = r.stdout
+    check("exits 0", r.returncode == 0, f"rc={r.returncode}")
+    check("does NOT declare the run over", "training is over" not in out, out[-900:])
+    check("marks the old sentinel stale", "sentinel=stale" in out, out[-900:])
+    check("says why", "below the cap 5500" in out, out[-900:])
+    check("pulls the new cumulative checkpoints", len(sb.pull_calls()) == 1,
+          str(sb.pull_calls()))
+    check("names them by their cumulative numbers",
+          "to fetch: step-2050, step-2100" in out, out[-900:])
+    check("installed them", (sb.dest / "genpt-step-2050.safetensors").exists()
+          and (sb.dest / "genpt-step-2100.safetensors").exists())
+    check("reports the cap it is working towards", "step-5500" in out, out[-900:])
 
 
-def scenario_handoff_target_step(sb: Sandbox) -> None:
-    print("\n[8] step-2000 exists -> same handoff, even with the trainer still up")
-    psw = spawn_marker_process("post_stop_watcher")
-    try:
-        sb.psw_lock.write_text(f"{psw.pid}\n")
-        r = sb.run({"ckpts": [1975, 2000], "trainers": 3}, LPW_MAX_CYCLES="0")
-        out = r.stdout
-        check("exits 0", r.returncode == 0, f"rc={r.returncode}")
-        check("recognises the cap", "step-2000 (the cap) exists" in out, out[-800:])
-        check("does not pull", sb.pull_calls() == [], str(sb.pull_calls()))
-    finally:
-        psw.kill()
+def scenario_a_fresh_sentinel_alone_is_not_the_end(sb: Sandbox) -> None:
+    print("\n[8] sentinel at the cap but the trainer is still alive -> keep pulling")
+    sb.local([1975])
+    r = sb.run({"ckpts": [1975, 2000], "sentinel": True, "sentinel_step": 2000,
+                "trainers": 3})
+    out = r.stdout
+    check("does not end on a file alone", "training is over" not in out, out[-900:])
+    check("still pulls", len(sb.pull_calls()) == 1, str(sb.pull_calls()))
 
 
 def scenario_trainer_gone_confirm(sb: Sandbox) -> None:
-    print("\n[9] trainers briefly at 0 -> confirmed twice before concluding the end")
+    print("\n[9] trainer gone once, heartbeat fresh -> not the end (restart window)")
+    sb.local([1800])
+    r = sb.run({"ckpts": [1800], "trainers": 0, "hb_mtime": 1787200000,
+                "box_epoch": 1787200060}, LPW_MAX_CYCLES="2")
+    out = r.stdout
+    check("counts the confirmation", "1/2 confirmations" in out, out[-900:])
+    check("a 60s-old heartbeat is not 'over'", "training is over" not in out,
+          out[-900:])
+    check("exits 0", r.returncode == 0, f"rc={r.returncode}")
+
+    print("     ...and gone twice WITH a long-static heartbeat -> that is the end")
+    r = sb.run({"ckpts": [1800, 2000], "trainers": 0, "hb_mtime": 1787200000,
+                "box_epoch": 1787209000, "pull_installs": [1800, 2000]},
+               LPW_MAX_CYCLES="0")
+    out = r.stdout
+    check("declares the run over", "training is over" in out, out[-1200:])
+    check("quotes both halves of the evidence",
+          "confirmed 2x" in out and "static for 9000s" in out, out[-1200:])
+    check("does the final backfill itself", len(sb.pull_calls()) == 1,
+          str(sb.pull_calls()))
+    check("fetched the last checkpoint",
+          (sb.dest / "genpt-step-2000.safetensors").exists())
+
+
+def scenario_final_pull_is_not_delegated(sb: Sandbox) -> None:
+    print("\n[10] the end, with post_stop_watcher alive -> still pulls here, no "
+          "handoff promise")
     psw = spawn_marker_process("post_stop_watcher")
     try:
         sb.psw_lock.write_text(f"{psw.pid}\n")
         sb.local([1800])
-        r = sb.run({"ckpts": [1800], "trainers": 0}, LPW_MAX_CYCLES="0")
+        r = sb.run({"ckpts": [1800, 2000], "trainers": 0, "hb_mtime": 1787200000,
+                    "box_epoch": 1787209000, "pull_installs": [1800, 2000]},
+                   LPW_MAX_CYCLES="0")
         out = r.stdout
-        check("requires two confirmations", "1/2 confirmations" in out, out[-800:])
-        check("then hands off", "trainer processes are gone (confirmed 2x)" in out,
-              out[-800:])
         check("exits 0", r.returncode == 0, f"rc={r.returncode}")
+        check("never claims another process will finish the job",
+              "handing off" not in out, out[-1200:])
+        check("pulls the remainder itself", len(sb.pull_calls()) == 1,
+              str(sb.pull_calls()))
+        check("fetched the cap checkpoint",
+              (sb.dest / "genpt-step-2000.safetensors").exists())
+        check("says the instance is still billing",
+              "still running and billing" in out, out[-1200:])
+        check("mentions the other watcher without relying on it",
+              f"pid {psw.pid}" in out and "do not assume it will act" in out,
+              out[-1200:])
     finally:
         psw.kill()
 
 
-def scenario_handoff_failsafe(sb: Sandbox) -> None:
-    print("\n[10] training over but post_stop_watcher is DEAD -> failsafe pull + alarm")
-    sb.psw_lock.write_text(f"{dead_pid()}\n")
-    sb.local([1800])
-    r = sb.run({"ckpts": [1800, 2000], "sentinel": True, "trainers": 0,
-                "pull_installs": [1800, 2000]}, LPW_MAX_CYCLES="0")
+def scenario_final_pull_reports_what_it_could_not_get(sb: Sandbox) -> None:
+    print("\n[11] the end, but the last pull fails -> names the remote-only files")
+    r = sb.run({"ckpts": [1800, 2000], "trainers": 0, "hb_mtime": 1787200000,
+                "box_epoch": 1787209000, "pull_exit": 4}, LPW_MAX_CYCLES="0")
     out = r.stdout
     check("exits 0", r.returncode == 0, f"rc={r.returncode}")
-    check("alerts that nobody owns the final pull",
-          "post_stop_watcher is NOT running" in out, out[-1200:])
-    check("does the final pull itself", len(sb.pull_calls()) == 1, str(sb.pull_calls()))
-    check("fetched the cap checkpoint",
-          (sb.dest / "genpt-step-2000.safetensors").exists())
-    check("warns the instance is still billing",
-          "STILL RUNNING AND BILLING" in out, out[-1200:])
-    check("never issues a stop itself", "vastai stop instance 48056192" in out
-          and "issuing" not in out.lower().split("vastai stop")[0][-40:], out[-300:])
+    check("alerts", "could NOT be fetched" in out, out[-1400:])
+    check("names both by cumulative step",
+          "step-1800" in out and "step-2000" in out, out[-1400:])
+    check("tells the human how to get them by hand",
+          "pull_latest_lora.py --all" in out, out[-1400:])
+
+
+def scenario_zombie_trainer_is_not_alive(sb: Sandbox) -> None:
+    print("\n[12] a zombie trainer does not keep the run 'alive'")
+    r = sb.run({"ckpts": [1800, 2000], "trainers": 0, "trainers_undead": 2,
+                "hb_mtime": 1787200000, "box_epoch": 1787209000,
+                "pull_installs": [1800, 2000]}, LPW_MAX_CYCLES="0")
+    out = r.stdout
+    check("reports them separately", "zombie/dead, not counted" in out, out[-1200:])
+    check("still concludes the run is over", "training is over" in out, out[-1200:])
+
+
+def scenario_unknown_count_keeps_pulling(sb: Sandbox) -> None:
+    print("\n[13] the box-side count did not run -> UNKNOWN, keep pulling, never 'over'")
+    sb.local([1800])
+    r = sb.run({"ckpts": [1800, 2000], "trainers_raw": ["sh: python3: not found"],
+                "hb_mtime": 1787200000, "box_epoch": 1787209000})
+    out = r.stdout
+    check("logs UNKNOWN rather than 0", "trainers=UNKNOWN" in out, out[-1200:])
+    check("does not declare the run over", "training is over" not in out, out[-1200:])
+    check("keeps pulling", len(sb.pull_calls()) == 1, str(sb.pull_calls()))
 
 
 def scenario_psw_mid_pull(sb: Sandbox) -> None:
-    print("\n[11] post_stop_watcher is mid-backfill -> yield the cycle")
+    print("\n[14] post_stop_watcher is mid-backfill -> yield the cycle")
     sb.psw_log.write_text(
         "[t] ----- pull_latest_lora.py --all output begins 2026-08-20T12:00:00 -----\n"
         "step-1850 -> genpt-step-1850.safetensors\n")
@@ -343,7 +426,7 @@ def scenario_psw_mid_pull(sb: Sandbox) -> None:
 
 
 def scenario_lock_live(sb: Sandbox) -> None:
-    print("\n[12] another live watcher holds the lock -> refuse to start")
+    print("\n[15] another live watcher holds the lock -> refuse to start")
     other = spawn_marker_process(str(WATCHER))
     try:
         (sb.art / "w.lock").write_text(f"{other.pid}\n")
@@ -359,7 +442,7 @@ def scenario_lock_live(sb: Sandbox) -> None:
 
 
 def scenario_lock_stale(sb: Sandbox) -> None:
-    print("\n[13] a lock from a dead owner -> taken over, not obeyed (power-loss case)")
+    print("\n[16] a lock from a dead owner -> taken over, not obeyed (power-loss case)")
     stale = dead_pid()
     (sb.art / "w.lock").write_text(f"{stale}\n")
     sb.local([1800])
@@ -371,7 +454,7 @@ def scenario_lock_stale(sb: Sandbox) -> None:
 
 
 def scenario_source_guarantees() -> None:
-    print("\n[14] structural guarantees about the file itself")
+    print("\n[17] structural guarantees about the file itself")
     src = WATCHER.read_text()
     body = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("#"))
     check("no destroy path exists in the file", "destroy" not in body.lower(),
@@ -383,6 +466,16 @@ def scenario_source_guarantees() -> None:
     check("child status comes from returncode", "proc.returncode" in body)
     check("artifacts default outside the repo",
           'Path.home() / ".lobora"' in src and str(HERE) not in src)
+    offenders = [ln for ln in src.splitlines()
+                 if not ln.lstrip().startswith("#")
+                 and "cmdline" in ln and "wc -l" in ln]
+    check("no grep-over-/proc pipeline survives in the code", not offenders,
+          str(offenders))
+    check("process counting is delegated to the one shared implementation",
+          "procscan.remote_scan_command" in src and "procscan.parse_section" in src
+          and "procscan.alive" in src)
+    check("the cap is read, not hardcoded",
+          'runcap.target_step("LPW_TARGET_STEP")' in src)
 
 
 # --------------------------------------------------------------------------- #
@@ -394,10 +487,13 @@ SCENARIOS = [
     scenario_pull_failure,
     scenario_ssh_transient,
     scenario_instance_stopped,
-    scenario_handoff_sentinel,
-    scenario_handoff_target_step,
+    scenario_stale_evidence_does_not_end_a_live_run,
+    scenario_a_fresh_sentinel_alone_is_not_the_end,
     scenario_trainer_gone_confirm,
-    scenario_handoff_failsafe,
+    scenario_final_pull_is_not_delegated,
+    scenario_final_pull_reports_what_it_could_not_get,
+    scenario_zombie_trainer_is_not_alive,
+    scenario_unknown_count_keeps_pulling,
     scenario_psw_mid_pull,
     scenario_lock_live,
     scenario_lock_stale,
