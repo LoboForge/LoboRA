@@ -214,6 +214,60 @@ a one-liner:
 and asserts the freeze happens before the signal. Run it **on the box** — its verdict
 asserts the live run is still alive.
 
+### Stopping the *instance* after the run: `scripts/post_stop_watcher.py`
+
+The box watcher halts training; it cannot stop the rented instance, because
+`pull_latest_lora.py` runs locally and the `vastai` CLI is authenticated locally. This
+one runs on **your** machine and closes that loop:
+
+```bash
+bash scripts/post_stop_watcher_start.sh     # detached; prints its pid and log path
+```
+
+Poll the box read-only → when the trainer is gone and `step-2000` exists (confirmed on
+two consecutive polls, checkpoint dir untouched for 120 s) → backfill every missing
+checkpoint with `pull_latest_lora.py --all` → verify each file independently of the pull
+script (208 tensors, contiguous offsets, `8 + header + payload == size`,
+`diffusion_model.` prefix with no `.default`, plus a live `sha256sum` cross-check against
+the box while SSH still works) → **only then** `vastai stop instance`, which drops
+billing from ~$1.1022/hr to storage-only (~$0.22/hr).
+
+**Fail-open is the design, not a fallback.** Any failure at all — a non-zero pull, a
+timeout, a verification failure on *any* checkpoint including older ones, a missing
+`step-2000`, insufficient disk, unreachable SSH, an early death or a stalled heartbeat —
+logs an `ALERT` banner and leaves the instance **running**. Paying idle GPU rent is far
+cheaper than losing the LoRA.
+
+Three things about it are load-bearing:
+
+- **Ordering.** Once the instance is stopped SSH is dead and nothing more can be
+  retrieved until it is restarted, so every pull and every verification must complete
+  first. That is why the stop is the last statement, not the first.
+- **`destroy` never appears as a string literal in the file**, so it structurally cannot
+  reach `subprocess`. Stopping preserves the 800 GB volume and the 8-hour `split-cache`
+  (§9); destroying takes both.
+- It covers a gap the box watcher has: a **stalled** heartbeat (frozen > 1 h with
+  trainers still alive) or an **early death** alerts loudly and explicitly does *not*
+  stop. And every subprocess status is read from the child's `returncode` with no pipe
+  in the path — the §7 `$?`-vs-`${PIPESTATUS[0]}` bug class cannot recur here.
+
+Checking on it, cancelling it, re-running it:
+
+```bash
+tail -f ~/.lobora/post_stop_watcher/post_stop_watcher.log     # or PSW_ARTIFACT_DIR
+cat ~/.lobora/post_stop_watcher/post_stop_watcher.state.json  # what it has done so far
+kill <pid>       # cancels the watcher only: stops nothing on the box, stops no instance
+```
+
+Safe to re-run at any time: a lock file refuses a second concurrent watcher, and the
+state file prevents a double stop or a redundant re-pull. It must run on a machine that
+**stays awake** — a suspended laptop is a watcher that never fires.
+
+`scripts/post_stop_watcher_selftest.py` drives that exact code against stub `ssh`,
+`vastai` and pull binaries: the detection path, every fail-open path, idempotency, the
+disk guard, the lock, and the shape of the real stop call validated in print-only mode
+so no instance is ever touched by the test. 74/74 assertions pass locally.
+
 To check a live run without trawling a multi-GB log, read the heartbeat the patched
 logger writes (step, loss, VRAM peak, headroom, attempt):
 

@@ -20,6 +20,11 @@ hf_cache/
 *.wav
 *.log
 logs/
+# post_stop_watcher runtime state. It writes to PSW_ARTIFACT_DIR outside the repo by
+# default; these keep its log/state/lock out even if someone points it in here.
+post_stop_watcher.state.json
+post_stop_watcher.lock
+post_stop_watcher.stdout
 # Dataset media and captions never belong in the repo. metadata.json/.csv embed the
 # caption text verbatim, so they are as sensitive as the captions themselves.
 dataset/
