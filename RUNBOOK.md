@@ -121,7 +121,9 @@ Even DiT-only, 80 GB is tight: peak **77.6 GiB of 79.14 GiB**. Naming one shard 
 - `--use_gradient_checkpointing_offload` — **the real lever.** Pushes checkpointed
   activations to host RAM. Costs ~15–30% step time. This is what made the run survive.
 
-Order of attack: fp8 the frozen base, then `expandable_segments`, then offload.
+Order of attack: fp8 the frozen base, then `expandable_segments`, then offload. If all
+three are already on and it still OOMs, the remaining lever is dropping the handful of
+over-long samples — §13.
 
 ## 4. Resume is weights-only, and will overwrite your checkpoints
 
@@ -370,8 +372,77 @@ which imports the module the trainer will actually import and **exits non-zero**
 fp8 fix is absent. That check is the only thing standing between a mis-targeted patch and
 a mystery OOM several GPU-hours later, because the fp8 failure mode emits nothing at all.
 
+## 13. Last-resort headroom: exclude the longest samples at read time
+
+Once fp8, `expandable_segments` and offload are all on (§3), the only lever left is the
+dataset itself. On the run this was written for, excluding **17 of 963** cached samples
+took peak VRAM from **77.5 to 76.35 GiB** (2.79 GiB headroom) and turned OOMs at 7h42m
+and 3h10m into a **10h+ clean run**.
+
+### Why nothing else works
+
+The trainer builds its loader with `collate_fn=lambda x: x[0]` — **batch size 1**. Peak
+memory is therefore set by the *single largest sample*, not by an average. Reordering,
+reshuffling and length-bucketing all leave a maximum unchanged, so none of them can buy
+a single byte. Dropping the sample is the only operation that lowers a maximum.
+
+And the thing that makes a sample large is **reference-image conditioning**, which enters
+the sequence *twice*: once as visual rows in the image stream, and again inside `text_len`,
+because the references are encoded by the Qwen3-VL processor into `prompt_embeds`. On this
+run that term was **54–78% of total sequence length**. Which is the counter-intuitive part:
+at this stage clip length and source fps barely matter, and the samples worth dropping are
+the ones carrying unusually many or unusually large *references*, not the long ones.
+
+### The measure
+
+Every cached sample records the packed sequence it will be trained on
+(`MiniMaxH3Pipeline._build_packed_ref2va`):
+
+```
+used    = text_len + ref_visual_rows + ref_audio_rows
+        + target_audio_rows            # audio_t * 2 channels
+        + target_video_rows            # latent_t * (latent_h // 2) * (latent_w // 2)
+seq_len = ceil(used / 64) * 64         # _SEQ_ALIGN = 64
+```
+
+At 480×832 the video term is **390 rows per latent frame**, hence the shorthand
+
+```
+seq_len ≈ 390 × latent_frames + 2 × ref_tokens + text_tokens + audio_tokens   (/64-aligned)
+```
+
+The threshold that worked was **`seq_len ≥ 38080`**.
+
+### The wiring
+
+`DIFFSYNTH_CACHE_EXCLUDE_FILE` points at a list file, one key per line, read by
+`UnifiedDataset.load_metadata` immediately after it walks the cache
+([`patches/diffsynth/site-packages/diffsynth_cache_exclude.diff`](patches/diffsynth/site-packages/diffsynth_cache_exclude.diff),
+optional — apply it only if you need it).
+
+It is a **read-time filter**. Nothing under `split-cache` is written, renamed or deleted,
+so it **does not invalidate the cache** (§9) and reverting it is `unset`. What it does
+change is `len(dataset)`, so the tqdm total drops by `excluded × dataset_repeat` —
+confirmed live, 6741 → 6622, and 6741 − 6622 = 119 = 17 × 7.
+
+```bash
+python scripts/vast/regen_cache_exclusions.py --cache $OUT/split-cache   # dry run: stats only
+python scripts/vast/regen_cache_exclusions.py --cache $OUT/split-cache \
+    --out $OUT/cache_exclude.txt
+export DIFFSYNTH_CACHE_EXCLUDE_FILE=$OUT/cache_exclude.txt              # then relaunch stage 2
+```
+
+**The list is not in this repo, deliberately.** Its keys derive from dataset filenames,
+which are media-derived and never committed. The repo carries the rule; the box
+regenerates the list. `regen_cache_exclusions.py` prints counts, thresholds and sequence
+length quantiles only — never a key — and refuses to write its output inside a git work
+tree. `--hashes` gives opaque sha256 prefixes if you want a reproducibility record.
+
 ## Privacy
 
 Dataset captions, images and video are never read for inspection, never printed, and
 never sent to any vision or multimodal model. `rebuild_metadata.py` reads sidecar
-captions only to place them in `metadata.json` and reports **counts only**.
+captions only to place them in `metadata.json` and reports **counts only**. Same rule for
+the §13 exclusion list: `regen_cache_exclusions.py` reports counts and sequence lengths,
+writes the dataset-derived keys to a file outside the repo, and refuses a destination
+inside a git work tree.

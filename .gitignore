@@ -30,6 +30,10 @@ post_stop_watcher.stdout
 dataset/
 metadata.json
 metadata.csv
+# DIFFSYNTH_CACHE_EXCLUDE_FILE lists (RUNBOOK §13). The keys derive from dataset
+# filenames. regen_cache_exclusions.py already refuses to write inside a work tree; this
+# is the second line of defence for a hand-written or --allow-in-repo list.
+cache_exclude*.txt
 .DS_Store
 .env
 training.env
