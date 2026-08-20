@@ -76,6 +76,11 @@ silently waste a day — above all the **ComfyUI key remap**, without which a tr
 adapter loads zero patches and renders as the base model. Scripts in
 [`scripts/vast/`](scripts/vast).
 
+Upstream DiffSynth-Studio **cannot train H3 unpatched** — it drops the local processor
+path and raises `ValueError: No valid model files` before the first step. The four source
+edits the run depended on, and the upstream commit they apply to, are in
+[`patches/diffsynth/`](patches/diffsynth).
+
 Resume after Ctrl+C:
 
 ```bash

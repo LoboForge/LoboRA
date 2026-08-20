@@ -4,13 +4,14 @@ Field notes from a full Ref2VA run on one 80 GB card, via DiffSynth-Studio's
 `examples/minimax_h3/model_training/train.py`. Everything here cost real time to find.
 Scripts referenced live in [`scripts/vast/`](scripts/vast).
 
-**Read these five first, they are the expensive ones:**
+**Read these six first, they are the expensive ones:**
 
-1. §1 — a LoRA that ComfyUI "loads" with zero patches renders as the base model.
-2. §4 — resume restores **weights only**, and the restarted step counter **overwrites** earlier checkpoints.
-3. §5 — `save_steps` counts **micro-batches**, not optimizer steps.
-4. §7 — piping the trainer through `tee` makes `$?` always `0`, silently killing crash recovery.
-5. §8 — OOM arrives at a **random** step, because sample order reshuffles every attempt.
+1. §12 — upstream DiffSynth **cannot train H3** unpatched; the four required edits are in [`patches/diffsynth/`](patches/diffsynth).
+2. §1 — a LoRA that ComfyUI "loads" with zero patches renders as the base model.
+3. §4 — resume restores **weights only**, and the restarted step counter **overwrites** earlier checkpoints.
+4. §5 — `save_steps` counts **micro-batches**, not optimizer steps.
+5. §7 — piping the trainer through `tee` makes `$?` always `0`, silently killing crash recovery.
+6. §8 — OOM arrives at a **random** step, because sample order reshuffles every attempt.
 
 ---
 
@@ -19,6 +20,8 @@ Scripts referenced live in [`scripts/vast/`](scripts/vast).
 ```bash
 export WORKSPACE=/workspace RUN=my_run          # every script reads these
 bash scripts/vast/bootstrap_diffsynth.sh        # diffsynth from git main + bitsandbytes
+git -C $WORKSPACE/DiffSynth-Studio apply \
+  $PWD/patches/diffsynth/diffsynth_box_hand_patches.diff   # REQUIRED, see §12
 python scripts/vast/patch_diffsynth_logger.py   # step-offset + heartbeat hooks
 python scripts/download_weights.py --dest $WORKSPACE/models/MiniMax-H3
 python scripts/vast/rebuild_metadata.py --dataset $WORKSPACE/dataset   # metadata.json
@@ -213,6 +216,25 @@ tail -5 $WORKSPACE/logs/h3_supervisor.log
 
 Vast **reassigns the SSH port on every instance restart**. Re-resolve with
 `vastai show instances`, then `LORA_SSH_PORT=<newport> scripts/pull_latest_lora.py`.
+
+## 12. Upstream DiffSynth needs four source edits
+
+Everything above assumes a **patched** DiffSynth-Studio. The four edits the run depended
+on are checked in as [`patches/diffsynth/diffsynth_box_hand_patches.diff`](patches/diffsynth/diffsynth_box_hand_patches.diff),
+with per-file rationale, the exact upstream base commit and reapply commands in
+[`diffsynth_box_hand_patches.md`](patches/diffsynth/diffsynth_box_hand_patches.md)
+alongside it. `git apply --check` was verified against a pristine upstream checkout, so
+the patch is reapplicable rather than archival.
+
+| File | Failure mode without it |
+|---|---|
+| `examples/minimax_h3/model_training/train.py` | **Training never starts.** Upstream rebuilds `ModelConfig` from `model_id`/`origin_file_pattern` and drops `path=`, so a local processor dir raises `ValueError: No valid model files`. |
+| `diffsynth/diffusion/training_module.py` | fp8 and offload **silently** do not apply to sharded models (`path in fp8_models` can't match, `path` is a list) — no error, just the VRAM blowup of §2/§3. |
+| `diffsynth/diffusion/runner.py` | Stage-1 preprocessing restarts from scratch after an interrupt, and one bad sample aborts the whole 8-hour pass (§9). |
+| `diffsynth/diffusion/logger.py` | Checkpoints restart at `step-100` and overwrite (§4). Superseded on the resumable path, still required by `scripts/vast/supervise_stage2.sh`. |
+
+The first three are still needed on every path. Reapply the patch after **any** diffsynth
+reinstall, together with `patch_diffsynth_logger.py`.
 
 ## Privacy
 
