@@ -14,6 +14,14 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/vast/h3_env.sh
 source "$HERE/h3_env.sh"
 
+# Stage 1 is eight hours of GPU time and the one artefact on this box that cannot
+# be re-fetched. Refuse to start it when there is a populated cache or a live
+# trainer; see stage1_guard.sh for the override, which names the cache on purpose.
+# shellcheck source=scripts/vast/stage1_guard.sh
+source "$HERE/stage1_guard.sh"
+STAGE1_ENTRYPOINT="bash $HERE/run_two_stage_train.sh" \
+  stage1_guard "$CACHE" "$RUN" "${HEIGHT}x${WIDTH}x${NUM_FRAMES}" || exit $?
+
 mkdir -p "$OUT" "$CACHE" "$LORA" "$LOGDIR"
 LOG=${TRAIN_LOG:-$LOGDIR/h3_train.log}
 

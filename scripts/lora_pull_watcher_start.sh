@@ -4,8 +4,12 @@
 # takes over a lock whose owner is dead.
 #
 # Log, state and lock go to LPW_ARTIFACT_DIR (default ~/.lobora/lora_pull_watcher),
-# never into this checkout. It pulls mid-training only; post_stop_watcher.py still
-# owns the final backfill and the instance stop.
+# never into this checkout.
+#
+# It pulls, and only pulls. There is no stop path anywhere in it, so leaving it
+# running cannot end the run or the billing; stopping the instance stays a human
+# decision. It does the final backfill itself when the run ends rather than
+# handing that to another process.
 set -uo pipefail
 
 HERE=$(cd -- "$(dirname -- "$0")" && pwd)
