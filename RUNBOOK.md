@@ -195,6 +195,25 @@ Stage 1 encodes the dataset to `$OUT/split-cache`. For this run: **963 files, ~8
 
 `scripts/vast/restart_stage2.sh` does all of the above in order.
 
+To cap a run at a chosen step (the example trainer ignores `train.steps` and runs a
+full `len(dataset) × dataset_repeat` pass), `scripts/vast/stop_at_step.sh` watches and
+stops it. Two things about it are not obvious and are the reason it is a script and not
+a one-liner:
+
+- It fires on the **cumulative** counter read from `step-N.safetensors` filenames, not
+  the tqdm bar. The two differ by `DIFFSYNTH_STEP_OFFSET` (§4), so watching the bar
+  stops at the wrong place by exactly the offset.
+- It **`SIGSTOP`s the supervisor before signalling the trainer.** The trainer shares the
+  supervisor's process group, so killing the supervisor first makes tmux tear the pane
+  down and `SIGHUP` the whole group, taking the trainer with it uncontrolled. Freezing
+  the restart loop keeps the shutdown ours to sequence: verify the checkpoint, freeze,
+  `SIGINT`→`SIGTERM`→`SIGKILL` the leaf trainer, then kill the frozen supervisor.
+
+`scripts/vast/stop_at_step_selftest.sh` drives that exact code against stub processes
+(decoy checkpoints, a truncated checkpoint, a trainer that ignores `SIGINT`/`SIGTERM`)
+and asserts the freeze happens before the signal. Run it **on the box** — its verdict
+asserts the live run is still alive.
+
 To check a live run without trawling a multi-GB log, read the heartbeat the patched
 logger writes (step, loss, VRAM peak, headroom, attempt):
 
