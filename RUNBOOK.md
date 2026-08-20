@@ -39,6 +39,9 @@ python scripts/vast/sample_baseline_ref2va.py   # base weights generate? (A/B co
 bash scripts/vast/run_two_stage_train.sh        # stage 1 cache, then stage 2 train
 ```
 
+`run_two_stage_train.sh` refuses to start stage 1 over an existing cache or a live
+trainer — see §9. That is the guard doing its job, not a failure.
+
 Re-run `patch_diffsynth_logger.py` after **any** diffsynth reinstall or upgrade: pip
 overwrites site-packages and takes the hooks with it, silently.
 
@@ -209,6 +212,31 @@ Stage 1 encodes the dataset to `$OUT/split-cache`. For this run: **963 files, ~8
   full stage 1 before changing shot geometry.
 - The cache is the expensive asset on an ephemeral box. It is the thing to protect.
 
+**`scripts/vast/stage1_guard.sh` protects it from the obvious mistake.** The stage-1
+entrypoint is what you type the first time and what tab-completion offers forever after,
+so it now refuses to start when there is something to lose:
+
+- **cache already populated** → exit 3. Even with unchanged geometry, all that run does
+  is hold the GPU for a verification pass; with changed geometry it re-encodes and what
+  is there is gone.
+- **a trainer is live** → exit 4. Two jobs on one GPU means the running one OOMs, the
+  supervisor reads that as a crash and relaunches into a half-dead GPU. **No token
+  overrides this**; stop the run first, deliberately.
+
+`STAGE1_FORCE=1` does *not* work, on purpose — that is what gets typed by someone not
+reading. The refusal prints the only value that does:
+`i-know-this-recomputes-<n>-cached-clips-for-<run>`, which names this cache and this run
+so one copied out of an older session cannot unlock a different job. The guard only ever
+reads: nothing under `split-cache` is written, moved or deleted on any path through it.
+
+```bash
+bash scripts/vast/stage1_guard.sh    # check only, reports and exits, runs nothing
+```
+
+Deployed on the box as `/workspace/stage1_guard.sh`, sourced by
+`/workspace/run_anatomy_train.sh` before anything expensive (the pre-guard copy is kept
+next to it as `.pre-guard.bak`). Covered by `tests/test_stage1_guard.py`.
+
 ## 10. Operating the box without shooting the run
 
 - **Never `pkill` / `killall`.** The pattern that matches the trainer also matches
@@ -235,12 +263,18 @@ a one-liner:
   supervisor's process group, so killing the supervisor first makes tmux tear the pane
   down and `SIGHUP` the whole group, taking the trainer with it uncontrolled. Freezing
   the restart loop keeps the shutdown ours to sequence: verify the checkpoint, freeze,
-  `SIGINT`→`SIGTERM`→`SIGKILL` the leaf trainer, then kill the frozen supervisor.
+  `SIGINT`→`SIGTERM`→`SIGKILL` the trainer tree leaves-first, reap, kill the supervisor,
+  then verify.
+
+Read the tmux-server post-mortem below before touching that script — it is the reason
+for the supervisor filter and the protected-pid list.
 
 `scripts/vast/stop_at_step_selftest.sh` drives that exact code against stub processes
 (decoy checkpoints, a truncated checkpoint, a trainer that ignores `SIGINT`/`SIGTERM`)
-and asserts the freeze happens before the signal. Run it **on the box** — its verdict
-asserts the live run is still alive.
+and asserts the freeze happens before the signal and that the run verifies its own
+completion. Run it **on the box** — its verdict asserts the live run is still alive,
+which also means it cannot be run during a paid run. The matching rules, which is where
+both real bugs lived, are covered off the box by `tests/test_stop_at_step_matcher.py`.
 
 ### Stopping the *instance* after the run: `scripts/post_stop_watcher.py`
 
@@ -252,21 +286,37 @@ one runs on **your** machine and closes that loop:
 bash scripts/post_stop_watcher_start.sh     # detached; prints its pid and log path
 ```
 
-Poll the box read-only → when the trainer is gone and `step-2000` exists (confirmed on
-two consecutive polls, checkpoint dir untouched for 120 s) → backfill every missing
+Poll the box read-only → when the trainer is gone and the target checkpoint exists
+(confirmed on two consecutive polls, checkpoint dir untouched for 120 s) → backfill every missing
 checkpoint with `pull_latest_lora.py --all` → verify each file independently of the pull
 script (208 tensors, contiguous offsets, `8 + header + payload == size`,
 `diffusion_model.` prefix with no `.default`, plus a live `sha256sum` cross-check against
 the box while SSH still works) → **only then** `vastai stop instance`, which drops
 billing from ~$1.1022/hr to storage-only (~$0.22/hr).
 
+The target step is read from `h3_env.sh` (`STOP_TARGET_STEP`) via `lobora/runcap.py`,
+never hardcoded — a watcher whose target is a step the run passed hours ago concludes
+that a live run has finished.
+
 **Fail-open is the design, not a fallback.** Any failure at all — a non-zero pull, a
 timeout, a verification failure on *any* checkpoint including older ones, a missing
-`step-2000`, insufficient disk, unreachable SSH, an early death or a stalled heartbeat —
-logs an `ALERT` banner and leaves the instance **running**. Paying idle GPU rent is far
-cheaper than losing the LoRA.
+target checkpoint, insufficient disk, unreachable SSH, an early death or a stalled
+heartbeat — logs an `ALERT` banner and leaves the instance **running**. Paying idle GPU
+rent is far cheaper than losing the LoRA.
 
-Three things about it are load-bearing:
+**The bounded override** exists because the original fire condition was a single
+`trainers == 0` that could never be true (see the grep bug below), so one lingering
+process could hold the run open forever. A fresh sentinel naming the target, plus a
+target checkpoint that is on the box and structurally whole, plus a quiet checkpoint
+dir, plus a heartbeat static past `PSW_OVERRIDE_STATIC_SECS` (measured on the *box's*
+clock, so restarting the watcher does not reset the timer) means the run is over
+whatever the process table says. Which path fired is logged. The override only changes
+when the sequence *starts* — the stop still requires every checkpoint to pull and
+verify. **Sentinel freshness is what keeps it safe:** a sentinel counts only if it
+records a step at or after the target and the heartbeat has not been written since,
+because the previous run's sentinel is still on the box while a new run climbs past it.
+
+Three more things about it are load-bearing:
 
 - **Ordering.** Once the instance is stopped SSH is dead and nothing more can be
   retrieved until it is restarted, so every pull and every verification must complete
@@ -293,8 +343,10 @@ state file prevents a double stop or a redundant re-pull. It must run on a machi
 
 `scripts/post_stop_watcher_selftest.py` drives that exact code against stub `ssh`,
 `vastai` and pull binaries: the detection path, every fail-open path, idempotency, the
-disk guard, the lock, and the shape of the real stop call validated in print-only mode
-so no instance is ever touched by the test. 74/74 assertions pass locally.
+disk guard, the lock, the override paths, a zombie that must not block the stop, a stale
+sentinel from a previous run, an unreadable process count, and the shape of the real
+stop call validated in print-only mode so no instance is ever touched by the test.
+114/114 assertions pass locally.
 
 ### Pulling *during* the run: `scripts/lora_pull_watcher.py`
 
@@ -313,22 +365,32 @@ round trip. Free space is checked against the backfill size first, and a cycle t
 cannot pull (SSH blip, failed pull, full disk) logs it and retries on the next one
 instead of dying.
 
-**It defers to the post-stop watcher rather than competing with it.** The two cannot
-share a lock — the post-stop watcher is typically already running from an older copy of
-the tree — so the coordination is one-sided and verifiable from this side only:
+**When it decides the run is over — and why that is not a file test.** Its first
+version exited as soon as it saw a stop sentinel *or* a `step-<cap>` checkpoint on the
+box, and handed the rest to the post-stop watcher. Files outlive the run that wrote
+them: training was relaunched from `step-2000` towards a higher cap while `step-2000`
+and the previous run's sentinel were still on disk, so the watcher declared the run
+finished **two seconds after starting** and pulled nothing for a 41-hour run. Twice.
 
-- **Handoff.** The moment training is over — stop sentinel present, `step-2000` on the
-  box, or the trainer processes gone (confirmed twice, so a supervisor restart is not
-  mistaken for the end) — this watcher logs a `FINAL:` line and **exits**. The final
-  backfill, the verification and the instance stop are the post-stop watcher's job, and
-  it does them better. The two therefore never want the same file at the same time.
-- **Mid-pull yield** covers the seconds around that boundary: if the post-stop watcher's
-  log shows a pull that started and has not ended, this one skips the cycle.
-- **Failsafe.** If training is over and the post-stop watcher is *not* alive, nobody
-  would fetch the last checkpoints, so this one does a final `--all` pull itself and
-  says loudly that the instance is still billing. It still never stops anything:
-  `vastai stop` does not appear in the file, only a read-only `vastai show instance`
-  used to recognise a box that is gone for good and exit instead of retrying forever.
+Termination is now evidence about the present, and needs both halves:
+
+- no live trainer process, confirmed on consecutive probes, **and**
+- a heartbeat that has not been written for `LPW_STATIC_SECS` (default 900 s)
+
+Either alone is a supervisor restart or a slow step. A sentinel corroborates only when
+it is **fresh** — it records a step at or after the cap and the heartbeat has not been
+written since — and is logged as `sentinel=stale` with the reason otherwise. The cap
+comes from `h3_env.sh` via `lobora/runcap.py`, so the file cannot hold a number the run
+has already passed. The expected next step is derived from the two newest checkpoint
+names rather than assumed, because the save cadence has changed between runs.
+
+**It does its own final pull.** It used to delegate that to the post-stop watcher, which
+was a promise it could not keep — see the grep bug below, which made that watcher's fire
+condition unsatisfiable. At the end it backfills, then states what is local and what is
+not. It still yields mid-cycle if the post-stop watcher's log shows an unterminated
+pull, so the two never fight over a file, and it still never stops anything: `vastai
+stop` does not appear in it, only a read-only `vastai show instance` used to recognise a
+box that is gone for good.
 
 Every exit writes one greppable `FINAL:` line, and a lock whose owner pid is dead (or
 has been recycled into an unrelated process) is taken over rather than obeyed — this
@@ -336,8 +398,84 @@ machine has already lost power once mid-run.
 
 `scripts/lora_pull_watcher_selftest.py` drives that exact code against stub `ssh`,
 `vastai` and pull binaries: the no-op cycle, the pull cycle, the disk guard, a pull that
-exits non-zero, transient vs permanent SSH failure, all three handoff paths, the mid-pull
-yield, and both lock cases. 59/59 assertions pass locally.
+exits non-zero, transient vs permanent SSH failure, the stale-evidence regression above,
+both halves of the termination rule, an unreadable process count, the mid-pull yield and
+both lock cases. 78/78 assertions pass locally.
+
+### The bug that made both watchers ornamental: a `grep` that matched itself
+
+Both watchers asked the box how many trainers were alive like this:
+
+```bash
+grep -l "model_tr""aining/train.py" /proc/[0-9]*/cmdline 2>/dev/null | wc -l
+```
+
+**That construct can never return 0.** In a pipeline the shell forks the child first and
+the *child* expands the glob, so the child's own `/proc/<pid>/cmdline` is in the list it
+hands to `grep`. By the time `grep` opens that file it has already `execve`'d, and the
+file now holds `grep`'s argv — which contains the search pattern as `argv[2]`. It matches
+itself, every time. The `"model_tr""aining"` splitting trick does not help: the shell
+joins the halves before `execve`, so it only defeats matching the *shell's* cmdline.
+
+The count was therefore permanently `real + 1`. `trainers == 0` was unsatisfiable, so
+the post-stop watcher's entire pull → verify → stop sequence was unreachable code that
+looked like a safety net; it polled an idle box for hours logging `ALERT [stalled]`.
+Roughly $3.50 of idle GPU rent, and a false sense of coverage that is worth more than
+the money.
+
+Symptoms to recognise: a count that is always exactly one higher than reality, a
+"nothing is running" condition that never fires, or a guard that refuses forever.
+
+The fix is `lobora/procscan.py`, the **one** process counter in this tree. It reads
+`/proc/<pid>/cmdline` directly in Python, with no shell and no glob, and excludes the
+pids that cannot honestly be counted: itself, its **ancestors** (over SSH the invoking
+shell's argv contains the pattern, because we sent it), its **descendants**, and
+anything in `Z`/`X` state — a zombie holds no GPU memory and cannot run. A pid whose
+state is unreadable counts as **live**, because every unknown must push callers towards
+"still running", never towards a stop. Both watchers import it, and the same source is
+shipped over SSH to run on the box, so the local and remote answers are the same code.
+
+`scripts/vast/stop_at_step.sh` is the one exception — the box has no checkout of this
+repo, so it restates the rules in bash. `tests/test_stop_at_step_matcher.py` runs that
+bash against a synthetic `/proc` and fails if it ever disagrees with `procscan`.
+
+**A section that arrives with no trailing `OK` line is `UNKNOWN`, not zero.** If python
+is missing on the box the watchers keep waiting; a broken probe must never look like an
+idle box.
+
+### The bug that ended the last stop attempt: killing the tmux server
+
+`stop_at_step.sh` matched two "supervisor candidates": the real
+`bash supervise_stage2.sh`, and the **tmux server**. tmux keeps the argv of whatever
+forked it, so a server started as `tmux new-session -d -s anatomy_train bash
+supervise_stage2.sh` has that string in its own `cmdline` — and is not a supervisor at
+all. The watcher froze both, stopped the trainer, logged `killing frozen supervisor
+pid=<tmux server>`, and `SIGKILL`ed it. That destroyed every session on that socket
+including the one it was running in; its log ends mid-sequence on that line, with no
+verification and no completion.
+
+What the script does now:
+
+- a supervisor must **match the pattern AND be a shell AND not be tmux**, and
+  `signal_pid` refuses outright to signal this script, any of its **ancestors**, pid 1,
+  or anything whose `comm` says tmux. A misclassification costs a log line, not a session
+- liveness comes from `/proc/<pid>/stat`, not `kill -0`, which a **zombie answers
+  forever** — the old ladder could burn every grace period on a process already dead
+- it signals the **whole tree**: the leaf trainer *and* the `accelerate launch` parent,
+  which carries `train.py` in its own argv. Stopping only the leaf leaves the launcher
+  holding the GPU
+- a `SIGSTOP`ped supervisor can never `wait()`, so anything killed under it stays a
+  zombie. It gets a **bounded `SIGCONT` window** (default 10 s, well under the 60 s retry
+  sleep) to reap, then is re-frozen and killed. Any trainer appearing in that window is
+  stopped and the supervisor re-frozen, so restart prevention is unchanged
+- it **verifies its own work**: `STOP_VERDICT` recounts both patterns and the verdict is
+  appended to the sentinel, so "did it finish?" is answerable from the artefacts
+
+Before arming it, ask what it would touch — this signals nothing and exits:
+
+```bash
+bash scripts/vast/stop_at_step.sh --list-matches
+```
 
 To check a live run without trawling a multi-GB log, read the heartbeat the patched
 logger writes (step, loss, VRAM peak, headroom, attempt):
