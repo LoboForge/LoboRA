@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -15,14 +17,18 @@ from lobora.console import banner, error, info, ok, tagged_tqdm, warn
 from lobora.dataset import H3Dataset, load_dataset
 from lobora.lora import (
     attach_lora,
-    find_resume_checkpoint,
     load_lora_weights,
-    load_optimizer,
-    optimizer_sidecar_path,
     resolve_resume_checkpoint,
     save_lora,
-    save_optimizer,
     write_checkpoint_sidecars,
+)
+from lobora.resume_state import (
+    ResumeStateError,
+    build_fingerprint,
+    find_resume_target,
+    load_optimizer_state,
+    optimizer_sidecar_for,
+    save_resume_state,
 )
 from lobora.sampling import (
     build_sample_jobs,
@@ -110,6 +116,21 @@ def _dummy_step(scheduler: H3FlowMatch, device: torch.device) -> float:
     return float(mse_flow_loss(pred, target).item())
 
 
+def _surrogate_step(scheduler: H3FlowMatch, device: torch.device, gain: torch.Tensor):
+    """Dry-run step that actually moves a parameter.
+
+    The dry run's job is to exercise the *plumbing* on CPU. Coupling the loss to one
+    real parameter means the optimizer accumulates real Adam moments and the LR
+    scheduler really advances, so a dry-run resume proves the state round-trip rather
+    than only the file layout.
+    """
+    x0 = torch.randn(1, 4, 2, 8, 8, device=device)
+    noise = torch.randn_like(x0)
+    target = scheduler.training_target(x0, noise)
+    pred = target * gain + 0.05 * torch.randn_like(target)
+    return mse_flow_loss(pred, target)
+
+
 class LoboRATrainer:
     def __init__(self, cfg: TrainerConfig, *, dry_run: bool = False) -> None:
         self.cfg = cfg
@@ -117,6 +138,9 @@ class LoboRATrainer:
         self.paths = output_paths(cfg)
         self.paths["root"].mkdir(parents=True, exist_ok=True)
         self.paths["checkpoints"].mkdir(parents=True, exist_ok=True)
+        # Which supervisor attempt this process is, recorded in the resume manifest so a
+        # checkpoint can be traced back to the run that produced it.
+        self.attempt = int(os.environ.get("LOBORA_ATTEMPT") or 1)
         self.device = torch.device("cuda" if torch.cuda.is_available() and not dry_run else "cpu")
         self.scheduler = H3FlowMatch(
             num_train_timesteps=cfg.train.num_train_timesteps,
@@ -230,10 +254,39 @@ class LoboRATrainer:
             marker.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         info(f"queued {len(jobs)} {tag} samples at step {step} (prompt text redacted from logs)")
 
-    def _save(self, model, optimizer, step: int, *, name: str | None = None) -> Path:
-        dest = self.paths["root"] / (name or f"lora_step_{step:06d}.safetensors")
-        if name is None:
-            dest = self.paths["checkpoints"] / f"lora_step_{step:06d}.safetensors"
+    def _fingerprint(self) -> dict[str, Any]:
+        # No height/width here: LoboRA buckets, so there is no single training
+        # resolution to pin. The DiffSynth path does record them, because there it is
+        # one fixed geometry and changing it invalidates the cached latents.
+        return build_fingerprint(
+            lora_rank=self.cfg.lora.rank,
+            lora_target_modules=self.cfg.lora.target_modules,
+            optimizer_class=self.cfg.train.optimizer,
+            learning_rate=self.cfg.train.learning_rate,
+            weight_decay=self.cfg.train.weight_decay,
+            gradient_accumulation_steps=self.cfg.train.gradient_accumulation_steps,
+            dataset_size=len(getattr(self, "samples", []) or []),
+            num_frames=self.cfg.dataset.default_frames,
+        )
+
+    def _save(
+        self,
+        model,
+        optimizer,
+        step: int,
+        *,
+        alias: str | None = None,
+        lr_scheduler=None,
+        emergency: bool = False,
+    ) -> Path:
+        """Write ``checkpoints/lora_step_NNNNNN.safetensors`` plus its resume state.
+
+        The numbered file is always the real artifact; ``alias`` only adds a pointer
+        copy (``lora_emergency`` / ``lora_final``) at the run root. Keeping every save
+        numbered by cumulative step is what stops a restarted run from writing
+        different weights under a name an earlier attempt already used.
+        """
+        dest = self.paths["checkpoints"] / f"lora_step_{step:06d}.safetensors"
         metadata = {
             "step": step,
             "rank": self.cfg.lora.rank,
@@ -252,15 +305,28 @@ class LoboRATrainer:
             )
         else:
             save_lora(model, dest, metadata=metadata)
-        if name is None:
-            write_checkpoint_sidecars(
-                dest,
-                output_dir=self.paths["root"],
-                checkpoints_dir=self.paths["checkpoints"],
-                step=step,
-            )
-            if optimizer is not None:
-                save_optimizer(optimizer, optimizer_sidecar_path(dest), step=step)
+        write_checkpoint_sidecars(
+            dest,
+            output_dir=self.paths["root"],
+            checkpoints_dir=self.paths["checkpoints"],
+            step=step,
+        )
+        if alias:
+            shutil.copy2(dest, self.paths["root"] / alias)
+        save_resume_state(
+            self.paths["checkpoints"],
+            step=step,
+            total_steps=self.cfg.train.steps,
+            epoch=0,
+            epoch_step=step,
+            attempt=self.attempt,
+            shuffle_seed=self.cfg.train.seed,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            fingerprint=self._fingerprint(),
+            checkpoint=dest.name,
+            emergency=emergency,
+        )
         return dest
 
     def train(self) -> None:
@@ -284,32 +350,10 @@ class LoboRATrainer:
         info(f"{len(self.samples)} samples  {len(sampler)} batches/epoch  target {self.cfg.train.steps} steps")
 
         model = None
-        optimizer = None
-        global_step = 0
-        resume = resolve_resume_checkpoint(
-            self.cfg.train.resume_from,
-            output_dir=self.paths["root"],
-            checkpoints_dir=self.paths["checkpoints"],
-        )
-        if resume is None and self.cfg.train.resume_from.lower() in {"latest", "auto"}:
-            resume = find_resume_checkpoint(
-                output_dir=self.paths["root"],
-                checkpoints_dir=self.paths["checkpoints"],
-            )
-        if resume is not None:
-            info(f"resume from {resume}")
-            if model is not None:
-                meta = load_lora_weights(model, resume)
-                global_step = int(meta["step"])
-                opt_path = optimizer_sidecar_path(resume)
-                if optimizer is not None and opt_path.is_file():
-                    load_optimizer(optimizer, opt_path)
-                    info("restored optimizer state")
-            else:
-                from lobora.lora import read_lora_checkpoint_metadata
-
-                global_step = int(read_lora_checkpoint_metadata(resume).get("step", 0) or 0)
-            self.cfg.sample.baseline_control = False
+        gain = torch.nn.Parameter(torch.full((), 0.9, device=self.device))
+        optimizer = _build_optimizer([gain], self.cfg)
+        lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
+        global_step = self._restore(model, optimizer, lr_scheduler)
 
         self._maybe_sample(0, tag="control")
         pending_losses: list[dict[str, Any]] = []
@@ -321,11 +365,15 @@ class LoboRATrainer:
                 for _batch in sampler:
                     if global_step >= self.cfg.train.steps:
                         break
-                    loss = _dummy_step(self.scheduler, self.device)
-                    running += loss
+                    loss_tensor = _surrogate_step(self.scheduler, self.device, gain)
+                    loss_tensor.backward()
+                    running += float(loss_tensor.item())
                     accum += 1
                     if accum < self.cfg.train.gradient_accumulation_steps:
                         continue
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
                     global_step += 1
                     mean = running / accum
                     running = 0.0
@@ -335,26 +383,94 @@ class LoboRATrainer:
                         _append_loss(self.paths["loss"], pending_losses)
                         pending_losses = []
                     if global_step % self.cfg.train.save_every == 0:
-                        self._save(model, optimizer, global_step)
+                        self._save(model, optimizer, global_step, lr_scheduler=lr_scheduler)
                         ok(f"saved step {global_step}  loss={mean:.4f}")
                     self._maybe_sample(global_step, tag="lora")
         except KeyboardInterrupt:
             if global_step > 0:
-                path = self._save(model, optimizer, global_step, name="lora_emergency.safetensors")
+                path = self._save(
+                    model,
+                    optimizer,
+                    global_step,
+                    alias="lora_emergency.safetensors",
+                    lr_scheduler=lr_scheduler,
+                    emergency=True,
+                )
                 warn(f"interrupted at step {global_step}; wrote {path}")
-                warn(f"resume with --resume latest")
+                warn("resume with --resume latest")
             raise
 
         if pending_losses:
             _append_loss(self.paths["loss"], pending_losses)
-        self._save(model, optimizer, global_step, name="lora_final.safetensors")
-        write_checkpoint_sidecars(
-            self.paths["root"] / "lora_final.safetensors",
-            output_dir=self.paths["root"],
-            checkpoints_dir=self.paths["checkpoints"],
-            step=global_step,
+        self._save(
+            model,
+            optimizer,
+            global_step,
+            alias="lora_final.safetensors",
+            lr_scheduler=lr_scheduler,
         )
         ok(f"done at step {global_step}")
+
+    def _restore(self, model, optimizer, lr_scheduler) -> int:
+        """Resolve the resume target and return the cumulative step to continue from.
+
+        Any resume state that exists but cannot be used raises ``ResumeStateError``
+        instead of falling through to step 0. Silently restarting is the failure this
+        whole mechanism exists to prevent.
+        """
+        token = (self.cfg.train.resume_from or "").strip()
+        if not token:
+            return 0
+
+        require_optimizer = not self.cfg.train.resume_allow_weights_only
+        if token.lower() in {"latest", "auto"}:
+            target = find_resume_target(
+                self.paths["checkpoints"], require_optimizer=require_optimizer
+            )
+            if target is None:
+                info("no resume state found; starting at step 0")
+                return 0
+            resume, optim_path, step = target.checkpoint, target.optimizer_state, target.step
+            info(f"resume from {target.describe()}")
+        else:
+            resume = resolve_resume_checkpoint(
+                token,
+                output_dir=self.paths["root"],
+                checkpoints_dir=self.paths["checkpoints"],
+            )
+            if resume is None:
+                return 0
+            optim_path = optimizer_sidecar_for(resume)
+            optim_path = optim_path if optim_path.is_file() else None
+            if optim_path is None and require_optimizer:
+                raise ResumeStateError(
+                    f"{resume.name} has no .optim.pt sidecar, so resuming would reset the Adam "
+                    f"moments and the LR schedule. Set train.resume_allow_weights_only=true to "
+                    f"accept that warm restart."
+                )
+            step = 0
+            info(f"resume from {resume}")
+
+        if model is not None:
+            step = int(load_lora_weights(model, resume)["step"])
+        elif step == 0:
+            from lobora.lora import read_lora_checkpoint_metadata
+
+            step = int(read_lora_checkpoint_metadata(resume).get("step", 0) or 0)
+
+        if optim_path is not None:
+            report = load_optimizer_state(
+                optim_path, optimizer=optimizer, lr_scheduler=lr_scheduler
+            )
+            ok(
+                f"restored optimizer moments + LR-scheduler position from {optim_path.name} "
+                f"(rng: {', '.join(report['rng']) or 'none'})"
+            )
+        else:
+            warn("weights-only resume: Adam moments and the LR schedule restart from zero")
+
+        self.cfg.sample.baseline_control = False
+        return step
 
 
 def run(cfg: TrainerConfig, *, dry_run: bool = False) -> None:

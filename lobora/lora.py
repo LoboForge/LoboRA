@@ -10,6 +10,11 @@ import torch
 from safetensors.torch import save_file
 
 from lobora.console import warn
+from lobora.resume_state import (
+    load_optimizer_state,
+    optimizer_sidecar_for,
+    save_optimizer_state,
+)
 
 SIDECARS = ("lora_emergency.safetensors", "lora_final.safetensors", "lora_latest.safetensors")
 
@@ -171,19 +176,17 @@ def write_checkpoint_sidecars(
     return numbered
 
 
+# One sidecar format for both trainers; see lobora/resume_state.py for the contract.
 def optimizer_sidecar_path(lora_path: Path) -> Path:
-    return lora_path.with_suffix(".optim.pt")
+    return optimizer_sidecar_for(lora_path)
 
 
 def save_optimizer(optimizer, path: Path, *, step: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"step": step, "optimizer": optimizer.state_dict()}, path)
+    save_optimizer_state(Path(path), step=step, optimizer=optimizer)
 
 
 def load_optimizer(optimizer, path: Path) -> int:
-    blob = torch.load(path, map_location="cpu", weights_only=False)
-    optimizer.load_state_dict(blob["optimizer"])
-    return int(blob.get("step", 0))
+    return int(load_optimizer_state(Path(path), optimizer=optimizer)["step"])
 
 
 def load_lora_weights(model, checkpoint_path: Path) -> dict[str, object]:

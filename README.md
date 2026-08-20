@@ -84,6 +84,41 @@ lobora configs/ref2va_bf16_80gb.yaml --output-dir ./output/run0 --resume latest
 
 Sidecars: `checkpoints/lora_step_NNNNNN.safetensors`, `lora_latest.safetensors`, `lora_emergency.safetensors`, `lora_final.safetensors`, plus `.optim.pt` optimizer state.
 
+## Resume state
+
+Every checkpoint is keyed on the **cumulative** step across all attempts, and carries
+enough state to continue rather than warm-restart:
+
+| File | Holds |
+|---|---|
+| `lora_step_NNNNNN.safetensors` / `step-N.safetensors` | adapter tensors |
+| `<same stem>.optim.pt` | Adam moments, LR-scheduler position, RNG |
+| `train_state.json` | authoritative cumulative step, epoch position, shuffle seed, run fingerprint |
+
+Because the step number is cumulative, a restarted run continues the lineage
+(`step-700`, `step-800`, …) and can never write different weights under a name an
+earlier attempt already used.
+
+Resume state that exists but cannot be used is **fatal, never silent**: a missing
+checkpoint, a manifest older than the directory, a missing `.optim.pt`, or a run
+config that drifted since the checkpoint was written all stop the run with an
+explanation. Pass `--allow-weights-only-resume` (or `LOBORA_ALLOW_WEIGHTS_ONLY_RESUME=1`
+on the DiffSynth path) to deliberately accept a warm restart with fresh Adam moments.
+
+### On the production DiffSynth path
+
+Live H3 runs go through DiffSynth's `examples/minimax_h3/model_training/train.py`,
+which persists none of this. `scripts/train_h3_resumable.py` is a drop-in wrapper —
+same flags, same output files — that patches the loop before running it:
+
+```bash
+accelerate launch --num_processes 1 --mixed_precision bf16 \
+  scripts/train_h3_resumable.py  [all the usual DiffSynth flags]
+```
+
+`scripts/supervise_h3_resumable.sh` drives it and treats exit code 3
+(“resume state unusable”) as fatal instead of burning a retry on it.
+
 ## Numerics gate
 
 A 50-step tiny run must keep mean loss roughly in `[0.15, 1.5]` and not rise. Long runs refuse to start without a passed `numerics_gate.json` unless you pass `--skip-numerics-gate`.
@@ -100,7 +135,7 @@ Unknown YAML keys are **warned**, not silently dropped.
 pytest -q
 ```
 
-CPU-only: grid math, buckets, cache keys (includes `model_rev`), Comfy key remap, scheduler signs, dry-run train.
+CPU-only: grid math, buckets, cache keys (includes `model_rev`), Comfy key remap, scheduler signs, dry-run train, resume round-trip (cumulative step, Adam moments, scheduler position) and checkpoint-name non-collision.
 
 ## License
 

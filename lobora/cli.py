@@ -30,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora-alpha", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--resume", type=str, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--allow-weights-only-resume",
+        action="store_true",
+        help="Accept a resume with no .optim.pt sidecar (warm restart, Adam moments lost)",
+    )
     parser.add_argument("--skip-numerics-gate", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="CPU dummy loop (no DiffSynth)")
     parser.add_argument(
@@ -82,6 +87,8 @@ def cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
         set_dotted(out, "train.batch_size", str(args.batch_size))
     if hasattr(args, "resume"):
         set_dotted(out, "train.resume_from", args.resume)
+    if getattr(args, "allow_weights_only_resume", False):
+        set_dotted(out, "train.resume_allow_weights_only", "true")
     if args.skip_numerics_gate:
         set_dotted(out, "train.skip_numerics_gate", "true")
     return out

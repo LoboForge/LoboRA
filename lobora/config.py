@@ -64,6 +64,9 @@ class TrainConfig:
     save_every: int = 250
     seed: int = 42
     resume_from: str = ""
+    # A resume with no .optim.pt sidecar is a warm restart, not a continuation. Refuse
+    # it by default so the loss of Adam moments is always a deliberate choice.
+    resume_allow_weights_only: bool = False
     skip_numerics_gate: bool = False
     numerics_gate_steps: int = 50
     numerics_loss_min: float = 0.15
