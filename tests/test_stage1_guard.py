@@ -150,6 +150,32 @@ def test_the_entrypoint_actually_calls_the_guard():
     assert entry.index("stage1_guard ") < entry.index('"sft:data_process"')
 
 
+def test_without_the_shared_matcher_it_refuses_rather_than_guesses(tmp_path: Path):
+    """Deployed as a lone file with no procscan.sh, it must fail CLOSED. A guard
+    that cannot tell whether a trainer is running and says yes anyway is worse
+    than no guard."""
+    lone = tmp_path / "workspace"
+    lone.mkdir()
+    (lone / "stage1_guard.sh").write_text(GUARD.read_text())
+    script = (f'source "{lone / "stage1_guard.sh"}"\n'
+              f'stage1_guard "{tmp_path}/empty-cache" run 480x832x73\n')
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                       timeout=120, env={"PATH": "/usr/bin:/bin"})
+    assert r.returncode == 5, r.stdout + r.stderr
+    assert "procscan.sh not found" in r.stderr
+
+
+def test_there_is_one_bash_matcher_and_the_callers_share_it():
+    """The bug this whole change exists to kill lived in two copies at once."""
+    vast = GUARD.parent
+    for caller in ("stage1_guard.sh", "stop_at_step.sh"):
+        text = (vast / caller).read_text()
+        assert "procscan.sh" in text, f"{caller} does not source the shared rules"
+        body = "\n".join(ln for ln in text.splitlines()
+                         if not ln.lstrip().startswith("#"))
+        assert "/cmdline" not in body, f"{caller} reads /proc on its own again"
+
+
 @pytest.mark.parametrize("suffix", [".pth", ".pt", ".safetensors", ".npy"])
 def test_every_shape_of_cache_entry_counts(tmp_path: Path, suffix: str):
     cache = tmp_path / "split-cache"

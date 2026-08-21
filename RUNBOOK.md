@@ -435,9 +435,22 @@ state is unreadable counts as **live**, because every unknown must push callers 
 "still running", never towards a stop. Both watchers import it, and the same source is
 shipped over SSH to run on the box, so the local and remote answers are the same code.
 
-`scripts/vast/stop_at_step.sh` is the one exception — the box has no checkout of this
-repo, so it restates the rules in bash. `tests/test_stop_at_step_matcher.py` runs that
-bash against a synthetic `/proc` and fails if it ever disagrees with `procscan`.
+The box-side shell scripts cannot import Python before a venv is guaranteed, so the
+rules are restated in bash **once**, in `scripts/vast/procscan.sh`, which
+`stop_at_step.sh` and `stage1_guard.sh` both source — deploy those files together, and
+note that both refuse to run at all if it is missing rather than degrading quietly.
+`tests/test_stop_at_step_matcher.py` runs the bash rules and the Python ones over the
+same synthetic `/proc` and fails if they ever disagree.
+
+Two things that file learned the hard way, both caught on the box:
+
+- its `/proc` root is `PROCFS`, **not** `PROC` — a sourced file shares the caller's
+  namespace, and the stage-1 entrypoint already used `PROC` for a model path. The
+  matcher scanned that directory, found nothing, and reported an idle GPU while two
+  trainers were running.
+- `SELF_TAG` must never be empty, because `case "$cmd" in *""*)` matches **every**
+  process. An empty tag skips the whole table — the grep bug's mirror image, and just
+  as quiet.
 
 **A section that arrives with no trailing `OK` line is `UNKNOWN`, not zero.** If python
 is missing on the box the watchers keep waiting; a broken probe must never look like an

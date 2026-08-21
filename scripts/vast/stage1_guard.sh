@@ -36,6 +36,7 @@
 #
 # EXIT CODES
 #   0 clear to proceed   3 refused: cache exists   4 refused: training is live
+#   2/5 refused: procscan.sh is missing, so it cannot tell -- fail closed
 set -uo pipefail
 
 # Anything that looks like a cache entry. Stage 1 writes one tensor file per clip.
@@ -50,26 +51,28 @@ stage1_cache_entries() {
     2>/dev/null | wc -l
 }
 
-# Live trainer processes, counted by reading /proc directly. NOT with
-# `ps | grep`: in a pipeline the child expands the glob and hands grep grep's own
-# /proc entry, whose contents are by then grep's argv -- pattern included -- so a
-# grep-based count never reaches zero and a guard built on it always refuses.
-# Z/X entries are skipped: a zombie holds no GPU memory.
-stage1_live_trainers() {
-  local pat=$1 pid cmd state n=0
-  for pid in /proc/[0-9]*; do
-    pid=${pid##*/}
-    [ "$pid" = "$$" ] && continue
-    cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)
-    [ -n "$cmd" ] || continue
-    case "$cmd" in *stage1_guard* | *"$0"*) continue ;; esac
-    case "$cmd" in *"$pat"*) ;; *) continue ;; esac
-    state=$(sed 's/.*)//' "/proc/$pid/stat" 2>/dev/null | awk '{print $1}')
-    case "$state" in Z | X | x | '') continue ;; esac
-    n=$((n + 1))
-  done
-  printf '%s\n' "$n"
-}
+# Process counting is NOT reimplemented here. procscan.sh holds those rules for
+# every bash caller in this tree, and lobora/procscan.py holds them for python;
+# the two are checked against each other by tests/test_stop_at_step_matcher.py. A
+# guard with its own private copy of the rules is a guard that drifts, and the
+# specific way it drifts -- a count that can never reach zero, because a grep
+# pipeline matches its own argv -- turns this file into one that refuses forever
+# and then gets deleted by whoever is trying to work.
+#
+# A guard without those rules must not run at all. Fail CLOSED.
+_STAGE1_GUARD_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ -f "$_STAGE1_GUARD_HERE/procscan.sh" ]; then
+  SELF_TAG=${SELF_TAG:-stage1_guard.sh}
+  # shellcheck source=scripts/vast/procscan.sh
+  source "$_STAGE1_GUARD_HERE/procscan.sh"
+else
+  printf 'FATAL: %s/procscan.sh not found -- stage1_guard cannot tell whether a\n' \
+    "$_STAGE1_GUARD_HERE" >&2
+  printf '       trainer is running, so it refuses to bless anything. Copy\n' >&2
+  printf '       procscan.sh next to this file (deploy the two together).\n' >&2
+  stage1_guard() { return 5; }
+  return 0 2>/dev/null || exit 5
+fi
 
 stage1_guard() {
   local cache=$1 run=$2 geometry=$3 pat=${4:-examples/minimax_h3/model_training/train.py}
@@ -78,7 +81,7 @@ stage1_guard() {
   # the printed override line unusable. The entrypoint names itself.
   local entry=${STAGE1_ENTRYPOINT:-$0}
 
-  trainers=$(stage1_live_trainers "$pat")
+  trainers=$(count_pids "$pat")
   if [ "$trainers" -gt 0 ]; then
     cat >&2 <<EOF
 

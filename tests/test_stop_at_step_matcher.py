@@ -157,6 +157,41 @@ def test_a_supervisor_that_is_not_a_shell_is_refused(tmp_path: Path):
     assert any("ignoring pid=500" in ln for ln in m["_stderr"]), m["_stderr"]
 
 
+def test_an_empty_self_tag_does_not_swallow_the_whole_process_table(box: Path):
+    """`case "$cmd" in *""*)` matches everything, so an unset tag would skip every
+    process and report an idle box. Caught in production, on the box, by a count
+    that came back 0 with two trainers plainly running."""
+    shared = SCRIPT.parent / "procscan.sh"
+    script = (f'SELF_TAG=""\nsource "{shared}"\n'
+              f'count_pids "{TRAINER_PAT}"\n')
+    proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                          timeout=120,
+                          env={"PATH": "/usr/bin:/bin", "PROCFS": str(box)})
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "2", proc.stdout + proc.stderr
+
+
+def test_the_proc_root_variable_cannot_collide_with_a_callers_own(tmp_path: Path):
+    """Found in production: the box's stage-1 entrypoint sets PROC to a model
+    path, and a sourced file shares the caller's namespace. The matcher happily
+    scanned that directory, found nothing, and reported an idle GPU with two
+    trainers running."""
+    shared = SCRIPT.parent / "procscan.sh"
+    body = shared.read_text()
+    assert "PROCFS=" in body and "$PROC/" not in body and '"$PROC"' not in body
+
+    root = tmp_path / "proc"
+    root.mkdir()
+    mkproc(root, 1, argv="/sbin/init", comm="init")
+    mkproc(root, 320, comm="python", ppid=1, argv=f"python {TRAINER_PAT}")
+    script = (f'PROC=/some/model/path\nsource "{shared}"\n'
+              f'count_pids "{TRAINER_PAT}"\n')
+    proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                          timeout=120,
+                          env={"PATH": "/usr/bin:/bin", "PROCFS": str(root)})
+    assert proc.stdout.strip() == "1", proc.stdout + proc.stderr
+
+
 def test_init_is_protected(box: Path):
     m = list_matches(box)
     assert "1" in m["PROTECTED"][0].split()

@@ -87,9 +87,9 @@ DRY_RUN=${STOP_DRY_RUN:-0}
 # Must stay well under the supervisor's H3_RETRY_SLEEP (60s) so it cannot reach
 # the point of launching another attempt.
 REAP_WINDOW=${STOP_REAP_WINDOW:-10}
-# Only ever anything else under test: tests/test_stop_at_step_matcher.py points it
-# at a synthetic tree and checks these rules agree with lobora/procscan.py.
-PROC=${STOP_PROC_ROOT:-/proc}
+# STOP_PROC_ROOT is consumed by procscan.sh (sourced below) and is only ever
+# anything but /proc under test: tests/test_stop_at_step_matcher.py points it at a
+# synthetic tree and checks those rules agree with lobora/procscan.py.
 
 SELF_TAG=$(basename "$0")
 
@@ -179,119 +179,21 @@ quiesced() {
 
 # -------------------------------------------------------------------- process --
 
-cmd_of() { tr '\0' ' ' <"$PROC/$1/cmdline" 2>/dev/null; }
-
-# From stat, not /proc/<pid>/comm, so it is the same field lobora/procscan.py
-# reads. Everything between the FIRST '(' and the LAST ')' -- a comm may contain
-# either character ("tmux: server" does not, but the parse should not depend on
-# that).
-comm_of() {
-  local s
-  s=$(cat "$PROC/$1/stat" 2>/dev/null) || return 0
-  s=${s#*(}
-  printf '%s' "${s%)*}"
-}
-
-ppid_of() {
-  # Everything after the last ')' is: state ppid ... -- avoids comm containing
-  # spaces or parens throwing the field count off.
-  sed 's/.*)//' "$PROC/$1/stat" 2>/dev/null | awk '{print $2}'
-}
-
-state_of() { sed 's/.*)//' "$PROC/$1/stat" 2>/dev/null | awk '{print $1}'; }
-
-# Z (zombie) and X/x (dead) are not alive: they hold no GPU memory and cannot run
-# an instruction, but they answer `kill -0` and appear in `ps` indefinitely. An
-# empty state means the process is gone.
-undead() {
-  case "$(state_of "$1")" in Z | X | x) return 0 ;; *) return 1 ;; esac
-}
-
-alive() {
-  local st
-  st=$(state_of "$1")
-  case "$st" in
-    '' | Z | X | x) return 1 ;;
-    *) return 0 ;;
-  esac
-}
-
-# tmux keeps the argv of whatever forked the server, so `tmux new-session -d -s
-# anatomy_train bash supervise_stage2.sh` leaves a server process whose cmdline
-# contains the supervisor pattern. It is not a supervisor, and killing it takes
-# down every session on that socket -- including this script's own.
-is_tmux() {
-  case "$(comm_of "$1")" in tmux*) return 0 ;; esac
-  case "$(cmd_of "$1")" in
-    tmux\ * | */tmux\ * | tmux) return 0 ;;
-  esac
-  return 1
-}
-
-is_shell() {
-  case "$(comm_of "$1")" in
-    bash | sh | dash | zsh | ksh) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# This script, everything that spawned it, and init. Computed once at start, and
-# consulted before every single signal.
-protected_pids() {
-  local p=$$ pp n=0
-  printf '%s\n1\n' "$$"
-  while [ "$n" -lt 64 ]; do
-    pp=$(ppid_of "$p")
-    case "$pp" in '' | 0) break ;; esac
-    printf '%s\n' "$pp"
-    p=$pp
-    n=$((n + 1))
-  done
-}
-PROTECTED=$(protected_pids)
-
-is_protected() {
-  case "
-$PROTECTED
-" in *"
-$1
-"*) return 0 ;; esac
-  return 1
-}
-
-# PIDs whose cmdline contains $1. Reads /proc directly rather than shelling out to
-# `ps | grep`: in a pipeline the child expands the glob and hands grep grep's own
-# /proc entry, which holds grep's argv -- pattern included -- so a grep matcher
-# always finds one process that is not there. Skips this script, its subshells
-# (a forked subshell keeps the script's argv), its ancestors, and tmux.
-find_pids() {
-  local pat=$1 pid cmd
-  for pid in "$PROC"/[0-9]*; do
-    pid=${pid##*/}
-    is_protected "$pid" && continue
-    cmd=$(cmd_of "$pid")
-    [ -n "$cmd" ] || continue
-    case "$cmd" in *"$SELF_TAG"*) continue ;; esac
-    case "$cmd" in *"$pat"*) ;; *) continue ;; esac
-    is_tmux "$pid" && continue
-    undead "$pid" && continue
-    printf '%s\n' "$pid"
-  done
-}
-
-# Matches that are in Z/X state: reported so they are visible in the audit trail,
-# never signalled and never waited for.
-find_undead_pids() {
-  local pat=$1 pid cmd
-  for pid in "$PROC"/[0-9]*; do
-    pid=${pid##*/}
-    is_protected "$pid" && continue
-    cmd=$(cmd_of "$pid")
-    [ -n "$cmd" ] || continue
-    case "$cmd" in *"$pat"*) ;; *) continue ;; esac
-    undead "$pid" && printf '%s\n' "$pid"
-  done
-}
+# Every rule about reading /proc lives in procscan.sh, which is sourced here and
+# by stage1_guard.sh, and which is checked against lobora/procscan.py by
+# tests/test_stop_at_step_matcher.py. Deploy the two files together: this script
+# is useless and dangerous without the exclusions in that one, so a missing
+# sibling is fatal rather than silently degraded.
+_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ ! -f "$_HERE/procscan.sh" ]; then
+  printf 'FATAL: %s/procscan.sh not found. It holds the process-matching rules\n' \
+    "$_HERE" >&2
+  printf '       that keep this script from signalling a tmux server. Copy it\n' >&2
+  printf '       next to this file and start again.\n' >&2
+  exit 2
+fi
+# shellcheck source=scripts/vast/procscan.sh
+source "$_HERE/procscan.sh"
 
 # A supervisor is a shell running the supervisor script. Not tmux, whatever its
 # argv says; not this script; not an ancestor of it.
@@ -304,16 +206,6 @@ supervisor_pids() {
       continue
     fi
     printf '%s\n' "$pid"
-  done
-}
-
-# Children of $1 that have exited and not been reaped.
-zombie_children_of() {
-  local parent=$1 pid
-  for pid in "$PROC"/[0-9]*; do
-    pid=${pid##*/}
-    [ "$(ppid_of "$pid")" = "$parent" ] || continue
-    undead "$pid" && printf '%s\n' "$pid"
   done
 }
 
