@@ -69,4 +69,10 @@ SAVE_STEPS=${SAVE_STEPS:-25}
 # training), post_stop_watcher.py (pulls, verifies, then stops the instance) and
 # lora_pull_watcher.py (pulls during the run) -- the two Python watchers parse this
 # very line via lobora/runcap.py. Change it here and nowhere else.
-STOP_TARGET_STEP=${STOP_TARGET_STEP:-5500}
+#
+# 6622 is not an arbitrary stopping point, it is total_steps: 946 usable samples x
+# DATASET_REPEAT 7 with num_epochs 1, which is what the tqdm total shows. The run
+# is therefore expected to reach its natural end and exit on its own, with the cap
+# watcher never firing -- the watchers still need the number so they know when a
+# finished run is finished rather than crashed.
+STOP_TARGET_STEP=${STOP_TARGET_STEP:-6622}

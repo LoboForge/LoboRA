@@ -2,7 +2,7 @@
 """runcap -- read the run's cumulative step cap from the one place it is declared.
 
 WHY NOT JUST A CONSTANT IN EACH FILE
-  The cap has moved twice in one week (2000 -> 6000 -> 5500) and it is read by
+  The cap has moved three times in one week (2000 -> 6000 -> 5500 -> 6622) and is read by
   three programs in two languages: scripts/vast/stop_at_step.sh stops training at
   it, scripts/post_stop_watcher.py decides the run is over at it, and
   scripts/lora_pull_watcher.py keeps pulling until it. A copy of the number in
@@ -25,14 +25,16 @@ import os
 import re
 from pathlib import Path
 
-# Matches the declaration in h3_env.sh:  STOP_TARGET_STEP=${STOP_TARGET_STEP:-5500}
+# Matches the declaration in h3_env.sh:  STOP_TARGET_STEP=${STOP_TARGET_STEP:-6622}
 _DECL_RE = re.compile(r"^\s*STOP_TARGET_STEP=\$\{STOP_TARGET_STEP:-(\d+)\}", re.M)
 
 DEFAULT_ENV_FILE = (Path(__file__).resolve().parent.parent
                     / "scripts" / "vast" / "h3_env.sh")
 
 # Only reached if h3_env.sh is unreadable, e.g. this file copied somewhere alone.
-FALLBACK_TARGET_STEP = 5500
+# Keep it in step with the declaration: this is the value a caller silently gets
+# when the parse fails, so a stale one here is a stale target nobody sees change.
+FALLBACK_TARGET_STEP = 6622
 
 
 def from_env_file(path: str | os.PathLike | None = None) -> int:

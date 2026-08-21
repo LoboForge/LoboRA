@@ -69,7 +69,7 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Process counting lives in the package, in ONE implementation, shared with
@@ -134,9 +134,15 @@ STATIC_SECS = env_int("LPW_STATIC_SECS", 900)
 SSH_TIMEOUT = env_int("LPW_SSH_TIMEOUT", 60)
 PULL_TIMEOUT = env_int("LPW_PULL_TIMEOUT", 5400)
 MAX_CYCLES = env_int("LPW_MAX_CYCLES", 0)               # 0 = until a terminal state
-# Longer than the run: 2000 -> 5500 at ~43 s/it is about 41 h, and a watcher that
-# retires at hour 16 covers less than half of it.
-MAX_RUNTIME_SECS = env_int("LPW_MAX_RUNTIME_SECS", 60 * 3600)
+# Comfortably longer than the run, because a watcher that retires early leaves the
+# LAST checkpoints -- the ones worth having -- sitting on rented hardware, which is
+# the exact failure it exists to prevent. The run to 6622 at the measured 43.5 s/it
+# is about 55 h, and it only ends once the trainer has also been quiet for
+# STATIC_SECS. 96 h leaves room for the ETA slipping, an OOM retry or two, and a
+# restart of this watcher partway through, at no cost: it exits as soon as the run
+# genuinely ends, and it has no stop path, so an over-long ceiling cannot bill
+# anything.
+MAX_RUNTIME_SECS = env_int("LPW_MAX_RUNTIME_SECS", 96 * 3600)
 SSH_FAILS_BEFORE_VASTAI = env_int("LPW_SSH_FAILS_BEFORE_VASTAI", 2)
 SSH_FAILS_BEFORE_GIVEUP = env_int("LPW_SSH_FAILS_BEFORE_GIVEUP", 10)
 
@@ -653,7 +659,13 @@ def main() -> int:
         f"file or a sentinel merely exists -- both outlive the run that wrote them")
     log(f"  proc count    : lobora/procscan.py shipped to the box (reads "
         f"/proc/<pid>/cmdline directly; no grep pipeline, no self-match)")
-    log(f"  max runtime   : {MAX_RUNTIME_SECS}s ({MAX_RUNTIME_SECS / 3600:.0f}h)")
+    # Printed as a wall-clock instant, not just a duration: "60h" is impossible to
+    # compare against an ETA at a glance, and the question that matters is whether
+    # this watcher outlives the run.
+    expiry = datetime.now(timezone.utc) + timedelta(seconds=MAX_RUNTIME_SECS)
+    log(f"  max runtime   : {MAX_RUNTIME_SECS}s ({MAX_RUNTIME_SECS / 3600:.0f}h) -- "
+        f"expires {expiry.strftime('%a %Y-%m-%d %H:%M')} UTC. The run must finish "
+        f"before then or the last checkpoints stay on the box.")
     log(f"  log/state/lock: {LOG_PATH.parent}")
     alive, pid = psw_running()
     log(f"  post_stop_watcher: {'RUNNING pid ' + str(pid) if alive else 'not running'} "

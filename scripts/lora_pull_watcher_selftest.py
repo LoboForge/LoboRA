@@ -168,8 +168,9 @@ class Sandbox:
             "LPW_RETRY_SECS": "0",
             "LPW_CONFIRM_SECS": "0",
             "LPW_MAX_CYCLES": "1",
-            # The live cap is 5500; these scenarios are written around 2000 and
-            # say so explicitly rather than leaning on the declared default.
+            # These scenarios are written around step 2000 and pin their own cap,
+            # so they neither depend on nor go stale with the declared one (which
+            # has moved four times: 2000, 6000, 5500, 6622).
             "LPW_TARGET_STEP": "2000",
             "LPW_STATIC_SECS": "900",
         })
@@ -294,19 +295,19 @@ def scenario_stale_evidence_does_not_end_a_live_run(sb: Sandbox) -> None:
     r = sb.run({"ckpts": [2000, 2050, 2100], "sentinel": True, "sentinel_step": 2000,
                 "sentinel_mtime": 1787200000, "hb_mtime": 1787209000,
                 "box_epoch": 1787209000, "hb_step": 2106, "trainers": 3},
-               LPW_TARGET_STEP="5500")
+               LPW_TARGET_STEP="6622")
     out = r.stdout
     check("exits 0", r.returncode == 0, f"rc={r.returncode}")
     check("does NOT declare the run over", "training is over" not in out, out[-900:])
     check("marks the old sentinel stale", "sentinel=stale" in out, out[-900:])
-    check("says why", "below the cap 5500" in out, out[-900:])
+    check("says why", "below the cap 6622" in out, out[-900:])
     check("pulls the new cumulative checkpoints", len(sb.pull_calls()) == 1,
           str(sb.pull_calls()))
     check("names them by their cumulative numbers",
           "to fetch: step-2050, step-2100" in out, out[-900:])
     check("installed them", (sb.dest / "genpt-step-2050.safetensors").exists()
           and (sb.dest / "genpt-step-2100.safetensors").exists())
-    check("reports the cap it is working towards", "step-5500" in out, out[-900:])
+    check("reports the cap it is working towards", "step-6622" in out, out[-900:])
 
 
 def scenario_a_fresh_sentinel_alone_is_not_the_end(sb: Sandbox) -> None:
@@ -317,6 +318,28 @@ def scenario_a_fresh_sentinel_alone_is_not_the_end(sb: Sandbox) -> None:
     out = r.stdout
     check("does not end on a file alone", "training is over" not in out, out[-900:])
     check("still pulls", len(sb.pull_calls()) == 1, str(sb.pull_calls()))
+
+    # The box-side cap watcher writes its sentinel BEFORE it stops the trainer, so
+    # a sentinel naming the current cap exists for a while with the run still up.
+    # Freshness must stay corroboration only; the live evidence is the gate.
+    print("     ...even a sentinel naming the CURRENT cap, written seconds ago")
+    r = sb.run({"ckpts": [6600, 6622], "sentinel": True, "sentinel_step": 6622,
+                "sentinel_mtime": 1787209000, "hb_mtime": 1787209010,
+                "box_epoch": 1787209020, "hb_step": 6624, "trainers": 2},
+               LPW_TARGET_STEP="6622")
+    out = r.stdout
+    check("sentinel reads as FRESH", "sentinel=FRESH" in out, out[-900:])
+    check("and still does not end the run", "training is over" not in out, out[-900:])
+    check("because a live trainer outranks any file",
+          "trainers=2" in out, out[-900:])
+
+    print("     ...and with the trainer gone but the heartbeat only 60s old")
+    r = sb.run({"ckpts": [6600, 6622], "sentinel": True, "sentinel_step": 6622,
+                "sentinel_mtime": 1787209000, "hb_mtime": 1787209000,
+                "box_epoch": 1787209060, "trainers": 0},
+               LPW_TARGET_STEP="6622", LPW_MAX_CYCLES="2")
+    check("a fresh sentinel does not shortcut the static-heartbeat wait",
+          "training is over" not in r.stdout, r.stdout[-900:])
 
 
 def scenario_trainer_gone_confirm(sb: Sandbox) -> None:
